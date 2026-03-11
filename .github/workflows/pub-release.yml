@@ -418,16 +418,21 @@ jobs:
                   LINKER_ENV: ${{ matrix.linker_env }}
                   LINKER: ${{ matrix.linker }}
                   USE_CROSS: ${{ matrix.use_cross }}
+                  ZEROCLAW_RELEASE_CARGO_FEATURES: channel-matrix
               run: |
+                  BUILD_ARGS=(--profile release-fast --locked --target ${{ matrix.target }})
+                  if [ -n "$ZEROCLAW_RELEASE_CARGO_FEATURES" ]; then
+                    BUILD_ARGS+=(--features "$ZEROCLAW_RELEASE_CARGO_FEATURES")
+                  fi
                   if [ -n "$LINKER_ENV" ] && [ -n "$LINKER" ]; then
                     echo "Using linker override: $LINKER_ENV=$LINKER"
                     export "$LINKER_ENV=$LINKER"
                   fi
                   if [ "$USE_CROSS" = "true" ]; then
-                    echo "Using cross for MUSL target"
-                    cross build --profile release-fast --locked --target ${{ matrix.target }}
+                    echo "Using cross for official release build"
+                    cross build "${BUILD_ARGS[@]}"
                   else
-                    cargo build --profile release-fast --locked --target ${{ matrix.target }}
+                    cargo build "${BUILD_ARGS[@]}"
                   fi
 
             - name: Check binary size (Unix)
