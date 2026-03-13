@@ -2148,9 +2148,20 @@ async fn process_channel_message(
         let _ = handle.await;
     }
 
-    // Thread the final reply only if tools were used (multi-message response)
-    if notify_observer_flag.tools_used.load(Ordering::Relaxed) && msg.channel != "cli" {
-        msg.thread_ts = followup_thread_id(&msg);
+    // Thread the final reply only if tools were used (multi-message response).
+    // Keep the original inbound thread_ts (raw platform timestamp) when available;
+    // only fall back to extracting from the message ID if thread_ts wasn't set.
+    if notify_observer_flag.tools_used.load(Ordering::Relaxed)
+        && msg.channel != "cli"
+        && msg.thread_ts.is_none()
+    {
+        // Extract raw timestamp from message ID (e.g. "slack_C123_1234.5678" → "1234.5678")
+        let raw_ts = msg
+            .id
+            .rsplit_once('_')
+            .map(|(_, ts)| ts.to_string())
+            .unwrap_or_else(|| msg.id.clone());
+        msg.thread_ts = Some(raw_ts);
     }
     // Drop the notify sender so the forwarder task finishes
     drop(notify_observer);
