@@ -2103,7 +2103,7 @@ async fn process_channel_message(
                     let _ = ch
                         .send(
                             &SendMessage::new(&text, &notify_reply_target)
-                                .in_thread(thread_ts.clone()),
+                                .in_thread(Some(thread_ts.clone())),
                         )
                         .await;
                 }
