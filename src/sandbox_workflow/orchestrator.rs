@@ -297,8 +297,22 @@ impl Orchestrator {
                 .await?;
         }
 
-        // Configure gh auth
-        self.e2b.exec(sid, "gh auth setup-git", 30, None).await?;
+        // Configure git credentials for private repo access.
+        // Inject GH_TOKEN directly into git URL rewriting (env var expansion
+        // isn't reliable across exec bridges).
+        if let Ok(gh_token) = std::env::var("GH_TOKEN") {
+            self.e2b
+                .exec(
+                    sid,
+                    &format!(
+                        "git config --global url.'https://{}@github.com/'.insteadOf 'https://github.com/'",
+                        gh_token
+                    ),
+                    30,
+                    None,
+                )
+                .await?;
+        }
 
         // Clone the repo
         let branch_flag = record
@@ -319,6 +333,19 @@ impl Orchestrator {
             );
         }
 
+        // Install Claude Code CLI (skip if using a custom template that has it)
+        let check = self.e2b.exec(sid, "which claude", 10, None).await;
+        if check.is_err() || check.as_ref().is_ok_and(|r| r.exit_code != 0) {
+            tracing::info!(workflow_id = %record.workflow_id, "Installing Claude Code CLI...");
+            let install = self
+                .e2b
+                .exec(sid, "npm install -g @anthropic-ai/claude-code", 120, None)
+                .await?;
+            if install.exit_code != 0 {
+                anyhow::bail!("Failed to install Claude Code: {}", install.stderr);
+            }
+        }
+
         Ok(())
     }
 
@@ -331,7 +358,7 @@ impl Orchestrator {
 
         let escaped_task = record.task.replace('\'', "'\\''");
         let cmd = format!(
-            "claude -p '{}' --permission-mode plan --dangerously-skip-permissions --output-format json",
+            "claude -p '{}' --permission-mode plan --output-format json",
             escaped_task
         );
 
@@ -346,10 +373,15 @@ impl Orchestrator {
             .await?;
 
         if result.exit_code != 0 {
+            let detail = if result.stderr.is_empty() {
+                result.stdout.clone()
+            } else {
+                result.stderr.clone()
+            };
             anyhow::bail!(
                 "Claude Code plan failed (exit {}): {}",
                 result.exit_code,
-                result.stderr
+                detail
             );
         }
 
@@ -358,20 +390,16 @@ impl Orchestrator {
         record.plan_text = Some(plan_text.clone());
         record.session_id = session_id;
 
-        // Post to Slack
+        // Post to Slack (top-level message — we don't have thread_ts yet)
         let message_text =
             slack_bridge::format_plan_message(&record.repo_url, &record.task, &plan_text);
-        let msg = SendMessage::new(&record.slack_channel, &message_text);
+        let msg = SendMessage::new(&message_text, &record.slack_channel);
         self.channel.send(&msg).await?;
 
-        // The first message's ts becomes our thread_ts.
-        // We use the channel_id as a fallback thread identifier.
-        // In practice, the Slack channel implementation will capture the
-        // actual thread_ts from the API response — but since we don't have
-        // direct access to that here, we rely on the thread router being
-        // registered with the Slack message's ts after the first reply.
-        // For now, we set a placeholder that the Slack listener will update.
-        record.slack_thread_ts = Some(format!("workflow:{}", record.workflow_id));
+        // Note: Channel::send() doesn't return the Slack message ts, so we
+        // can't thread follow-up messages yet. Future improvement: extend the
+        // Channel trait to return message metadata. For now, all messages go
+        // to the channel root.
 
         Ok(())
     }
@@ -385,7 +413,7 @@ impl Orchestrator {
 
         let escaped_feedback = feedback.replace('\'', "'\\''");
         let mut cmd = format!(
-            "claude -p '{escaped_feedback}' --permission-mode plan --dangerously-skip-permissions --output-format json"
+            "claude -p '{escaped_feedback}' --permission-mode plan --output-format json"
         );
 
         if let Some(ref sess_id) = record.session_id {
@@ -627,10 +655,16 @@ impl Orchestrator {
         }
     }
 
-    /// Send a message in the workflow's Slack thread.
+    /// Send a message in the workflow's Slack channel (threaded if we have a real thread_ts).
     async fn send_thread_message(&self, record: &WorkflowRecord, text: &str) {
-        let msg =
-            SendMessage::new(&record.slack_channel, text).in_thread(record.slack_thread_ts.clone());
+        // Only use thread_ts if it's a real Slack timestamp (contains a dot),
+        // not our placeholder format.
+        let thread_ts = record
+            .slack_thread_ts
+            .as_deref()
+            .filter(|ts| ts.contains('.'))
+            .map(String::from);
+        let msg = SendMessage::new(text, &record.slack_channel).in_thread(thread_ts);
         if let Err(e) = self.channel.send(&msg).await {
             tracing::warn!(
                 workflow_id = %record.workflow_id,

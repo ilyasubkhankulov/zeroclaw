@@ -20,10 +20,10 @@ pub struct CommandResult {
 
 /// E2B sandbox metadata returned on creation.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SandboxInfo {
+    #[serde(rename = "sandboxID")]
     pub sandbox_id: String,
-    #[serde(default)]
+    #[serde(rename = "clientID", default)]
     pub client_id: String,
 }
 
@@ -112,14 +112,15 @@ try:
     print(json.dumps({{"stdout": r.stdout, "stderr": r.stderr, "exit_code": r.exit_code}}))
 except Exception as e:
     err = str(e)
-    # Extract exit code from CommandExitException
-    code = 1
-    if "exited with code" in err:
+    stdout = getattr(e, 'stdout', '') or ''
+    stderr = getattr(e, 'stderr', '') or err
+    code = getattr(e, 'exit_code', 1) or 1
+    if code == 1 and "exited with code" in err:
         try:
             code = int(err.split("exited with code")[1].split()[0])
         except Exception:
             pass
-    print(json.dumps({{"stdout": "", "stderr": err, "exit_code": code}}))
+    print(json.dumps({{"stdout": stdout, "stderr": stderr, "exit_code": code}}))
 "#,
             api_key = py_str(&self.api_key),
             sandbox_id = py_str(sandbox_id),
