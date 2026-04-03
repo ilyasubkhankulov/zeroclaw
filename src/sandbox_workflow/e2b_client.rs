@@ -1,15 +1,17 @@
-//! E2B REST API client for sandbox lifecycle management.
+//! E2B client for sandbox lifecycle management.
 //!
-//! Talks directly to the E2B API via `reqwest` — no Python/JS sidecar needed.
+//! Uses `reqwest` for the management API (create/destroy/status) and shells
+//! out to a Python helper for command execution, since the E2B runtime uses
+//! the Connect protocol (gRPC-over-HTTP) which requires protobuf framing.
 
-use base64::Engine as _;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::process::Command;
 
 /// Result of a command executed inside a sandbox.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CommandResult {
     pub stdout: String,
     pub stderr: String,
@@ -28,6 +30,7 @@ pub struct SandboxInfo {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateSandboxRequest {
+    #[serde(rename = "templateID")]
     template_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     timeout: Option<u64>,
@@ -35,29 +38,7 @@ struct CreateSandboxRequest {
     envs: HashMap<String, String>,
 }
 
-#[derive(Debug, Serialize)]
-struct ExecRequest {
-    cmd: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    timeout: Option<u64>,
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    envs: HashMap<String, String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cwd: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ExecResponse {
-    #[serde(default)]
-    stdout: String,
-    #[serde(default)]
-    stderr: String,
-    #[serde(default)]
-    exit_code: i32,
-}
-
-/// Lightweight client for the E2B sandbox REST API.
+/// Client for E2B sandbox operations.
 pub struct E2bClient {
     client: Client,
     api_url: String,
@@ -94,7 +75,7 @@ impl E2bClient {
         let resp = self
             .client
             .post(&url)
-            .header("X-E2B-API-Key", &self.api_key)
+            .header("X-API-Key", &self.api_key)
             .json(&body)
             .send()
             .await?;
@@ -109,6 +90,9 @@ impl E2bClient {
     }
 
     /// Execute a shell command inside a running sandbox.
+    ///
+    /// Uses the E2B Python SDK as a subprocess since the runtime API uses the
+    /// Connect protocol (protobuf-framed gRPC-over-HTTP).
     pub async fn exec(
         &self,
         sandbox_id: &str,
@@ -116,56 +100,95 @@ impl E2bClient {
         timeout_secs: u64,
         cwd: Option<&str>,
     ) -> anyhow::Result<CommandResult> {
-        let url = format!("{}/sandboxes/{}/commands", self.api_url, sandbox_id);
-        let body = ExecRequest {
-            cmd: command.to_string(),
-            timeout: Some(timeout_secs),
-            envs: HashMap::new(),
-            cwd: cwd.map(String::from),
-        };
+        let cwd_arg = cwd.unwrap_or("/home/user");
+        let script = format!(
+            r#"
+import json, sys, os
+os.environ["E2B_API_KEY"] = {api_key}
+from e2b import Sandbox
+sbx = Sandbox.connect({sandbox_id})
+try:
+    r = sbx.commands.run({cmd}, cwd={cwd}, timeout={timeout})
+    print(json.dumps({{"stdout": r.stdout, "stderr": r.stderr, "exit_code": r.exit_code}}))
+except Exception as e:
+    err = str(e)
+    # Extract exit code from CommandExitException
+    code = 1
+    if "exited with code" in err:
+        try:
+            code = int(err.split("exited with code")[1].split()[0])
+        except Exception:
+            pass
+    print(json.dumps({{"stdout": "", "stderr": err, "exit_code": code}}))
+"#,
+            api_key = py_str(&self.api_key),
+            sandbox_id = py_str(sandbox_id),
+            cmd = py_str(command),
+            cwd = py_str(cwd_arg),
+            timeout = timeout_secs,
+        );
 
-        let resp = self
-            .client
-            .post(&url)
-            .header("X-E2B-API-Key", &self.api_key)
-            .timeout(Duration::from_secs(timeout_secs + 30))
-            .json(&body)
-            .send()
-            .await?;
+        let output = Command::new("python3")
+            .arg("-c")
+            .arg(&script)
+            .env("E2B_API_KEY", &self.api_key)
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to run E2B exec helper (is python3 + e2b installed?): {e}")
+            })?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("E2B exec failed ({status}): {text}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !output.status.success() && stdout.trim().is_empty() {
+            anyhow::bail!("E2B exec helper failed: {stderr}");
         }
 
-        let exec_resp: ExecResponse = resp.json().await?;
-        Ok(CommandResult {
-            stdout: exec_resp.stdout,
-            stderr: exec_resp.stderr,
-            exit_code: exec_resp.exit_code,
+        serde_json::from_str(stdout.trim()).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse E2B exec output: {e}\nstdout: {stdout}\nstderr: {stderr}"
+            )
         })
     }
 
-    /// Write a file inside a sandbox. Creates parent directories automatically.
-    ///
-    /// Uses the sandbox exec API to write via heredoc — simpler and more
-    /// reliable than the files endpoint for small text files like credentials.
+    /// Write a file inside a sandbox.
     pub async fn write_file(
         &self,
         sandbox_id: &str,
         path: &str,
         content: &str,
     ) -> anyhow::Result<()> {
-        // Use base64 to avoid shell escaping issues with the file content
-        let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
-        let cmd = format!(
-            "mkdir -p $(dirname {path}) && echo '{encoded}' | base64 -d > {path}"
+        let script = format!(
+            r#"
+import os
+os.environ["E2B_API_KEY"] = {api_key}
+from e2b import Sandbox
+sbx = Sandbox.connect({sandbox_id})
+sbx.files.write({path}, {content})
+print("ok")
+"#,
+            api_key = py_str(&self.api_key),
+            sandbox_id = py_str(sandbox_id),
+            path = py_str(path),
+            content = py_str(content),
         );
-        let result = self.exec(sandbox_id, &cmd, 30, None).await?;
-        if result.exit_code != 0 {
-            anyhow::bail!("Failed to write {path}: {}", result.stderr);
+
+        let output = Command::new("python3")
+            .arg("-c")
+            .arg(&script)
+            .env("E2B_API_KEY", &self.api_key)
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to run E2B write helper: {e}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("E2B write_file failed: {stderr}");
         }
+
         Ok(())
     }
 
@@ -175,7 +198,7 @@ impl E2bClient {
         matches!(
             self.client
                 .get(&url)
-                .header("X-E2B-API-Key", &self.api_key)
+                .header("X-API-Key", &self.api_key)
                 .send()
                 .await,
             Ok(resp) if resp.status().is_success()
@@ -188,7 +211,7 @@ impl E2bClient {
         let resp = self
             .client
             .delete(&url)
-            .header("X-E2B-API-Key", &self.api_key)
+            .header("X-API-Key", &self.api_key)
             .send()
             .await?;
 
@@ -199,6 +222,16 @@ impl E2bClient {
         }
         Ok(())
     }
+}
+
+/// Escape a string as a Python string literal.
+fn py_str(s: &str) -> String {
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
+    format!("'{escaped}'")
 }
 
 #[cfg(test)]
@@ -225,9 +258,16 @@ mod tests {
             envs: HashMap::new(),
         };
         let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["templateId"], "my-template");
+        assert_eq!(json["templateID"], "my-template");
         assert_eq!(json["timeout"], 3600);
-        // Empty envs should be omitted
         assert!(json.get("envs").is_none());
+    }
+
+    #[test]
+    fn py_str_escaping() {
+        assert_eq!(py_str("hello"), "'hello'");
+        assert_eq!(py_str("it's"), "'it\\'s'");
+        assert_eq!(py_str("line1\nline2"), "'line1\\nline2'");
+        assert_eq!(py_str("back\\slash"), "'back\\\\slash'");
     }
 }

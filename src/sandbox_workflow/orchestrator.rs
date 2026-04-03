@@ -219,12 +219,7 @@ impl Orchestrator {
         // Claude Code CLI needs ANTHROPIC_API_KEY; gh CLI needs GH_TOKEN.
         // API_KEY is also forwarded so users can map it to ANTHROPIC_API_KEY
         // inside the sandbox if they prefer a single key.
-        for var in &[
-            "ANTHROPIC_API_KEY",
-            "API_KEY",
-            "GH_TOKEN",
-            "GITHUB_TOKEN",
-        ] {
+        for var in &["ANTHROPIC_API_KEY", "API_KEY", "GH_TOKEN", "GITHUB_TOKEN"] {
             if let Ok(val) = std::env::var(var) {
                 envs.insert((*var).into(), val);
             }

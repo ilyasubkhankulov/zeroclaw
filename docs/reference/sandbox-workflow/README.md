@@ -20,7 +20,7 @@ graph TD
 ## Prerequisites
 
 - **E2B account** with an API key ([e2b.dev/dashboard](https://e2b.dev/dashboard))
-- **E2B custom template** built from the included Dockerfile (see [Building the E2B Template](#building-the-e2b-template))
+- **Python 3 + `e2b` package** installed on the ZeroClaw host (`pip install e2b`) -- used for sandbox command execution
 - **Slack channel** configured in ZeroClaw
 - **GitHub access** via `GH_TOKEN` environment variable
 - **Claude Code auth** via Max subscription or `ANTHROPIC_API_KEY`

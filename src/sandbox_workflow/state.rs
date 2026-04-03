@@ -154,4 +154,33 @@ mod tests {
         assert_eq!(deserialized.workflow_id, "wf-2");
         assert_eq!(deserialized.state, WorkflowState::Initializing);
     }
+
+    #[test]
+    fn workflow_record_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut record = WorkflowRecord::new(
+            "wf-disk".into(),
+            "https://github.com/test/repo".into(),
+            "test persistence".into(),
+            "C789".into(),
+        );
+        record.sandbox_id = Some("sb-123".into());
+        record.session_id = Some("sess-456".into());
+        record.transition(WorkflowState::AwaitingFeedback);
+        record.plan_text = Some("1. Do stuff\n2. More stuff".into());
+        record.iteration_count = 2;
+
+        record.save(dir.path()).unwrap();
+
+        let loaded = WorkflowRecord::load(&dir.path().join("wf-disk.json")).unwrap();
+        assert_eq!(loaded.workflow_id, "wf-disk");
+        assert_eq!(loaded.state, WorkflowState::AwaitingFeedback);
+        assert_eq!(loaded.sandbox_id.as_deref(), Some("sb-123"));
+        assert_eq!(loaded.session_id.as_deref(), Some("sess-456"));
+        assert_eq!(
+            loaded.plan_text.as_deref(),
+            Some("1. Do stuff\n2. More stuff")
+        );
+        assert_eq!(loaded.iteration_count, 2);
+    }
 }
