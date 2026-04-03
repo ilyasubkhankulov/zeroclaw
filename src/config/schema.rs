@@ -413,6 +413,10 @@ pub struct Config {
     #[serde(default)]
     pub claude_code_runner: ClaudeCodeRunnerConfig,
 
+    /// Sandbox coding workflow: E2B + Claude Code plan mode (`[sandbox_workflow]`).
+    #[serde(default)]
+    pub sandbox_workflow: SandboxWorkflowConfig,
+
     /// Codex CLI tool configuration (`[codex_cli]`).
     #[serde(default)]
     pub codex_cli: CodexCliConfig,
@@ -3646,6 +3650,106 @@ impl Default for ClaudeCodeRunnerConfig {
             ssh_host: None,
             tmux_prefix: default_claude_code_runner_tmux_prefix(),
             session_ttl: default_claude_code_runner_session_ttl(),
+        }
+    }
+}
+
+// ── Sandbox Workflow (E2B + Claude Code) ──────────────────────
+
+/// Sandbox coding workflow configuration (`[sandbox_workflow]` section).
+///
+/// Spins up an E2B cloud sandbox, runs Claude Code in plan mode, posts the
+/// plan to a Slack thread for iterative review, executes on approval, and
+/// creates a GitHub PR.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SandboxWorkflowConfig {
+    /// Enable the `sandbox_coding_task` tool and `/api/sandbox-workflow` endpoint.
+    #[serde(default)]
+    pub enabled: bool,
+    /// E2B API key (falls back to `E2B_API_KEY` env var).
+    #[serde(default)]
+    pub e2b_api_key: String,
+    /// E2B custom template ID (must have claude, git, gh pre-installed).
+    #[serde(default)]
+    pub e2b_template: String,
+    /// E2B API base URL.
+    #[serde(default = "default_sandbox_e2b_api_url")]
+    pub e2b_api_url: String,
+    /// Sandbox time-to-live in seconds (default: 3600).
+    #[serde(default = "default_sandbox_timeout_secs")]
+    pub sandbox_timeout_secs: u64,
+    /// Maximum plan revision iterations before auto-failing (default: 10).
+    #[serde(default = "default_sandbox_max_iterations")]
+    pub max_iterations: u32,
+    /// Timeout per Claude Code plan invocation in seconds (default: 300).
+    #[serde(default = "default_sandbox_plan_timeout_secs")]
+    pub plan_timeout_secs: u64,
+    /// Timeout for Claude Code execution phase in seconds (default: 900).
+    #[serde(default = "default_sandbox_exec_timeout_secs")]
+    pub exec_timeout_secs: u64,
+    /// How long to wait for user approval in seconds (default: 86400 = 24h).
+    #[serde(default = "default_sandbox_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+    /// Default Slack channel ID for posting plans (can be overridden per-task).
+    #[serde(default)]
+    pub default_slack_channel: Option<String>,
+    /// Extra env vars passed into the sandbox (e.g. custom tokens).
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+    /// Git user.name for commits inside the sandbox.
+    #[serde(default)]
+    pub git_user_name: Option<String>,
+    /// Git user.email for commits inside the sandbox.
+    #[serde(default)]
+    pub git_user_email: Option<String>,
+    /// Path to Claude Code credentials file (`.credentials.json`) for Max subscription auth.
+    /// Defaults to `$HOME/.claude/.credentials.json`. Run `claude auth login` once in the
+    /// ZeroClaw container to populate this; it will be copied into each E2B sandbox.
+    #[serde(default)]
+    pub claude_credentials_path: Option<String>,
+}
+
+fn default_sandbox_e2b_api_url() -> String {
+    "https://api.e2b.dev".into()
+}
+
+fn default_sandbox_timeout_secs() -> u64 {
+    3600
+}
+
+fn default_sandbox_max_iterations() -> u32 {
+    10
+}
+
+fn default_sandbox_plan_timeout_secs() -> u64 {
+    300
+}
+
+fn default_sandbox_exec_timeout_secs() -> u64 {
+    900
+}
+
+fn default_sandbox_approval_timeout_secs() -> u64 {
+    86400
+}
+
+impl Default for SandboxWorkflowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            e2b_api_key: String::new(),
+            e2b_template: String::new(),
+            e2b_api_url: default_sandbox_e2b_api_url(),
+            sandbox_timeout_secs: default_sandbox_timeout_secs(),
+            max_iterations: default_sandbox_max_iterations(),
+            plan_timeout_secs: default_sandbox_plan_timeout_secs(),
+            exec_timeout_secs: default_sandbox_exec_timeout_secs(),
+            approval_timeout_secs: default_sandbox_approval_timeout_secs(),
+            default_slack_channel: None,
+            env_passthrough: Vec::new(),
+            git_user_name: None,
+            git_user_email: None,
+            claude_credentials_path: None,
         }
     }
 }
@@ -8438,6 +8542,7 @@ impl Default for Config {
             verifiable_intent: VerifiableIntentConfig::default(),
             claude_code: ClaudeCodeConfig::default(),
             claude_code_runner: ClaudeCodeRunnerConfig::default(),
+            sandbox_workflow: SandboxWorkflowConfig::default(),
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
@@ -11600,6 +11705,7 @@ auto_save = true
             verifiable_intent: VerifiableIntentConfig::default(),
             claude_code: ClaudeCodeConfig::default(),
             claude_code_runner: ClaudeCodeRunnerConfig::default(),
+            sandbox_workflow: SandboxWorkflowConfig::default(),
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
@@ -12130,6 +12236,7 @@ default_temperature = 0.7
             verifiable_intent: VerifiableIntentConfig::default(),
             claude_code: ClaudeCodeConfig::default(),
             claude_code_runner: ClaudeCodeRunnerConfig::default(),
+            sandbox_workflow: SandboxWorkflowConfig::default(),
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),

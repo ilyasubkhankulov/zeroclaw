@@ -69,6 +69,7 @@ pub mod providers;
 pub mod rag;
 pub mod routines;
 pub mod runtime;
+pub mod sandbox_workflow;
 pub(crate) mod security;
 pub(crate) mod service;
 pub(crate) mod skills;

@@ -103,6 +103,7 @@ mod peripherals;
 mod plugins;
 mod providers;
 mod runtime;
+mod sandbox_workflow;
 mod security;
 mod service;
 mod skillforge;
