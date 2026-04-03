@@ -1,7 +1,6 @@
-use super::poll::ChannelMapHandle;
 use super::traits::{Tool, ToolResult};
 use crate::config::SandboxWorkflowConfig;
-use crate::sandbox_workflow::{Orchestrator, ThreadRouter, WorkflowParams};
+use crate::sandbox_workflow::{Orchestrator, WorkflowParams};
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
@@ -11,22 +10,13 @@ use std::sync::Arc;
 /// Slack iteration + PR creation.
 pub struct SandboxCodingTaskTool {
     config: SandboxWorkflowConfig,
-    channels: ChannelMapHandle,
-    router: Arc<ThreadRouter>,
     workspace_dir: PathBuf,
 }
 
 impl SandboxCodingTaskTool {
-    pub fn new(
-        config: SandboxWorkflowConfig,
-        channels: ChannelMapHandle,
-        router: Arc<ThreadRouter>,
-        workspace_dir: &std::path::Path,
-    ) -> Self {
+    pub fn new(config: SandboxWorkflowConfig, workspace_dir: &std::path::Path) -> Self {
         Self {
             config,
-            channels,
-            router,
             workspace_dir: workspace_dir.to_path_buf(),
         }
     }
@@ -97,40 +87,20 @@ impl Tool for SandboxCodingTaskTool {
             });
         }
 
+        if self.config.slack_bot_token.is_none() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("sandbox_workflow.slack_bot_token is not set in config".into()),
+            });
+        }
+
         let branch = args
             .get("branch")
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        // Find a Slack channel from the channel map
-        let channel = {
-            let map = self.channels.read();
-            // Look for any channel named "slack" (the Slack channel adapter)
-            map.values()
-                .find(|ch| {
-                    let name = ch.name();
-                    name.contains("slack") || name.contains("Slack")
-                })
-                .cloned()
-        };
-
-        let channel: Arc<dyn crate::channels::Channel> = match channel {
-            Some(ch) => ch,
-            None => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some("No Slack channel available. Ensure Slack is configured.".into()),
-                });
-            }
-        };
-
-        let orchestrator = Arc::new(Orchestrator::new(
-            self.config.clone(),
-            channel,
-            Arc::clone(&self.router),
-            &self.workspace_dir,
-        ));
+        let orchestrator = Arc::new(Orchestrator::new(self.config.clone(), &self.workspace_dir));
 
         let params = WorkflowParams {
             task,

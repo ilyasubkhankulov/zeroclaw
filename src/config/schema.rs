@@ -3707,6 +3707,10 @@ pub struct SandboxWorkflowConfig {
     /// ZeroClaw container to populate this; it will be copied into each E2B sandbox.
     #[serde(default)]
     pub claude_credentials_path: Option<String>,
+    /// Slack bot token for posting plans and polling thread replies.
+    /// Required for Slack integration. Use the same `xoxb-...` token as `channels_config.slack`.
+    #[serde(default)]
+    pub slack_bot_token: Option<String>,
 }
 
 fn default_sandbox_e2b_api_url() -> String {
@@ -3750,6 +3754,7 @@ impl Default for SandboxWorkflowConfig {
             git_user_name: None,
             git_user_email: None,
             claude_credentials_path: None,
+            slack_bot_token: None,
         }
     }
 }

@@ -14,4 +14,3 @@ pub mod slack_bridge;
 pub mod state;
 
 pub use orchestrator::{Orchestrator, WorkflowParams};
-pub use slack_bridge::ThreadRouter;

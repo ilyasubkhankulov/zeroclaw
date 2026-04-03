@@ -794,11 +794,8 @@ pub fn all_tools_with_runtime(
 
     // Sandbox coding workflow (E2B + Claude Code plan mode)
     if root_config.sandbox_workflow.enabled {
-        let sandbox_router = Arc::new(crate::sandbox_workflow::ThreadRouter::new());
         tool_arcs.push(Arc::new(SandboxCodingTaskTool::new(
             root_config.sandbox_workflow.clone(),
-            Arc::clone(&channel_map_handle),
-            sandbox_router,
             workspace_dir,
         )));
     }

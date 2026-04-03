@@ -1,18 +1,17 @@
 //! Workflow orchestrator: drives the state machine, bridges E2B <-> Slack.
 //!
 //! Each workflow spawns a tokio task that runs through the state machine from
-//! `Initializing` to `Completed` (or `Failed`). Thread messages from Slack
-//! arrive via an `mpsc` channel.
+//! `Initializing` to `Completed` (or `Failed`). Slack interaction is handled
+//! via direct Slack Web API calls (not through the Channel trait) so we can
+//! capture message timestamps for threading and poll for replies.
 
-use crate::channels::Channel;
-use crate::channels::traits::SendMessage;
 use crate::config::SandboxWorkflowConfig;
+use reqwest::Client;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 use super::e2b_client::E2bClient;
-use super::slack_bridge::{self, ThreadMessage, ThreadRouter};
+use super::slack_bridge;
 use super::state::{WorkflowRecord, WorkflowState};
 
 /// Parameters for launching a new workflow.
@@ -27,18 +26,13 @@ pub struct WorkflowParams {
 pub struct Orchestrator {
     config: SandboxWorkflowConfig,
     e2b: E2bClient,
-    channel: Arc<dyn Channel>,
-    router: Arc<ThreadRouter>,
+    http: Client,
+    slack_bot_token: String,
     workflows_dir: PathBuf,
 }
 
 impl Orchestrator {
-    pub fn new(
-        config: SandboxWorkflowConfig,
-        channel: Arc<dyn Channel>,
-        router: Arc<ThreadRouter>,
-        workspace_dir: &std::path::Path,
-    ) -> Self {
+    pub fn new(config: SandboxWorkflowConfig, workspace_dir: &std::path::Path) -> Self {
         let api_key = if config.e2b_api_key.is_empty() {
             std::env::var("E2B_API_KEY").unwrap_or_default()
         } else {
@@ -46,12 +40,14 @@ impl Orchestrator {
         };
         let e2b = E2bClient::new(&config.e2b_api_url, &api_key);
         let workflows_dir = workspace_dir.join("sandbox_workflows");
+        let http = Client::new();
+        let slack_bot_token = config.slack_bot_token.clone().unwrap_or_default();
 
         Self {
             config,
             e2b,
-            channel,
-            router,
+            http,
+            slack_bot_token,
             workflows_dir,
         }
     }
@@ -82,7 +78,6 @@ impl Orchestrator {
 
     /// Run the full workflow state machine.
     async fn run_workflow(&self, mut record: WorkflowRecord) -> anyhow::Result<()> {
-        // Persist initial state
         let _ = record.save(&self.workflows_dir);
 
         // Phase 1: Initialize sandbox
@@ -108,75 +103,82 @@ impl Orchestrator {
             }
         }
 
-        // Phase 3: Feedback loop
-        let (tx, mut rx) = mpsc::channel::<ThreadMessage>(32);
-
-        // Register thread for routing
-        if let Some(ref thread_ts) = record.slack_thread_ts {
-            self.router
-                .register(record.slack_channel.clone(), thread_ts.clone(), tx)
-                .await;
-        }
-
+        // Phase 3: Feedback loop — poll Slack thread for replies
         record.transition(WorkflowState::AwaitingFeedback);
         let _ = record.save(&self.workflows_dir);
 
-        let approval_timeout = tokio::time::Duration::from_secs(self.config.approval_timeout_secs);
+        let approval_deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(self.config.approval_timeout_secs);
+        // Track the last message ts we've seen to only fetch new replies
+        let mut last_seen_ts = record.slack_thread_ts.clone().unwrap_or_default();
 
         loop {
-            let msg = tokio::time::timeout(approval_timeout, rx.recv()).await;
+            if tokio::time::Instant::now() > approval_deadline {
+                self.fail(&mut record, "Approval timed out").await;
+                return Ok(());
+            }
 
-            match msg {
-                Ok(Some(thread_msg)) => {
-                    if slack_bridge::is_approval(&thread_msg.text) {
-                        // Approved — proceed to execution
-                        break;
+            // Poll for new thread replies every 3 seconds
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+            let thread_ts = match record.slack_thread_ts.clone() {
+                Some(ts) => ts,
+                None => continue,
+            };
+
+            let replies = self
+                .poll_slack_replies(&record.slack_channel, &thread_ts, &last_seen_ts)
+                .await;
+
+            let mut approved = false;
+            for (ts, text) in replies {
+                last_seen_ts = ts;
+
+                if slack_bridge::is_approval(&text) {
+                    self.post_slack_reply(
+                        &record.slack_channel,
+                        &thread_ts,
+                        &slack_bridge::format_execution_started(),
+                    )
+                    .await;
+                    approved = true;
+                    break;
+                }
+
+                // Feedback — revise the plan
+                if record.iteration_count >= self.config.max_iterations {
+                    self.fail(
+                        &mut record,
+                        &format!("Max iterations ({}) reached", self.config.max_iterations),
+                    )
+                    .await;
+                    return Ok(());
+                }
+
+                record.transition(WorkflowState::Revising);
+                let _ = record.save(&self.workflows_dir);
+                match self.revise_plan(&mut record, &text).await {
+                    Ok(()) => {
+                        record.transition(WorkflowState::AwaitingFeedback);
+                        let _ = record.save(&self.workflows_dir);
                     }
-
-                    // Feedback — revise the plan
-                    if record.iteration_count >= self.config.max_iterations {
-                        self.fail(
-                            &mut record,
-                            &format!("Max iterations ({}) reached", self.config.max_iterations),
-                        )
-                        .await;
+                    Err(e) => {
+                        self.fail(&mut record, &format!("Revision failed: {e}"))
+                            .await;
                         return Ok(());
                     }
+                }
+            }
 
-                    record.transition(WorkflowState::Revising);
-                    let _ = record.save(&self.workflows_dir);
-                    match self.revise_plan(&mut record, &thread_msg.text).await {
-                        Ok(()) => {
-                            record.transition(WorkflowState::AwaitingFeedback);
-                            let _ = record.save(&self.workflows_dir);
-                        }
-                        Err(e) => {
-                            self.fail(&mut record, &format!("Revision failed: {e}"))
-                                .await;
-                            return Ok(());
-                        }
-                    }
-                }
-                Ok(None) => {
-                    // Channel closed
-                    self.fail(&mut record, "Thread message channel closed")
-                        .await;
-                    return Ok(());
-                }
-                Err(_) => {
-                    // Timeout
-                    self.fail(&mut record, "Approval timed out").await;
-                    return Ok(());
-                }
+            if approved {
+                break;
             }
         }
 
         // Phase 4: Execute
         record.transition(WorkflowState::Executing);
         let _ = record.save(&self.workflows_dir);
-        self.send_thread_message(&record, &slack_bridge::format_execution_started())
-            .await;
-        match self.execute_plan(&mut record, &mut rx).await {
+        match self.execute_plan(&mut record).await {
             Ok(()) => {}
             Err(e) => {
                 self.fail(&mut record, &format!("Execution failed: {e}"))
@@ -201,7 +203,7 @@ impl Orchestrator {
         record.transition(WorkflowState::Completed);
         let _ = record.save(&self.workflows_dir);
         if let Some(ref pr_url) = record.pr_url {
-            self.send_thread_message(&record, &slack_bridge::format_pr_created(pr_url))
+            self.post_slack_thread_message(&record, &slack_bridge::format_pr_created(pr_url))
                 .await;
         }
 
@@ -211,20 +213,16 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Initialize the E2B sandbox and clone the repo.
+    // ── Sandbox lifecycle ─────────────────────────────────────────
+
     async fn initialize_sandbox(&self, record: &mut WorkflowRecord) -> anyhow::Result<()> {
         let mut envs = std::collections::HashMap::new();
 
-        // Pass through env vars that the sandbox needs.
-        // Claude Code CLI needs ANTHROPIC_API_KEY; gh CLI needs GH_TOKEN.
-        // API_KEY is also forwarded so users can map it to ANTHROPIC_API_KEY
-        // inside the sandbox if they prefer a single key.
         for var in &["ANTHROPIC_API_KEY", "API_KEY", "GH_TOKEN", "GITHUB_TOKEN"] {
             if let Ok(val) = std::env::var(var) {
                 envs.insert((*var).into(), val);
             }
         }
-        // Pass through configured extras
         for var in &self.config.env_passthrough {
             if let Ok(val) = std::env::var(var) {
                 envs.insert(var.clone(), val);
@@ -244,10 +242,7 @@ impl Orchestrator {
 
         let sid = &sandbox.sandbox_id;
 
-        // Copy Claude Code credentials into the sandbox (Max subscription OAuth).
-        // On Linux (including Docker), credentials live at ~/.claude/.credentials.json.
-        // The user runs `claude auth login` once in the ZeroClaw container;
-        // we copy the resulting file into each sandbox so Claude Code reuses the session.
+        // Copy Claude Code credentials (Max subscription OAuth)
         let creds_path = self
             .config
             .claude_credentials_path
@@ -266,11 +261,8 @@ impl Orchestrator {
                     tracing::info!("Copied Claude Code credentials into sandbox");
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        path = %creds_path.display(),
-                        error = %e,
-                        "Could not read Claude Code credentials — sandbox will need ANTHROPIC_API_KEY"
-                    );
+                    tracing::warn!(path = %creds_path.display(), error = %e,
+                        "Could not read Claude Code credentials");
                 }
             }
         }
@@ -297,16 +289,16 @@ impl Orchestrator {
                 .await?;
         }
 
-        // Configure git credentials for private repo access.
-        // Inject GH_TOKEN directly into git URL rewriting (env var expansion
-        // isn't reliable across exec bridges).
+        // Configure git + gh auth for private repos.
+        // Write GH_TOKEN to sandbox profile so all commands can access it,
+        // and configure git URL rewriting for clone auth.
         if let Ok(gh_token) = std::env::var("GH_TOKEN") {
             self.e2b
                 .exec(
                     sid,
                     &format!(
-                        "git config --global url.'https://{}@github.com/'.insteadOf 'https://github.com/'",
-                        gh_token
+                        "echo 'export GH_TOKEN={gh_token}' >> /home/user/.bashrc && \
+                         git config --global url.'https://{gh_token}@github.com/'.insteadOf 'https://github.com/'"
                     ),
                     30,
                     None,
@@ -314,7 +306,7 @@ impl Orchestrator {
                 .await?;
         }
 
-        // Clone the repo
+        // Clone repo
         let branch_flag = record
             .base_branch
             .as_deref()
@@ -333,7 +325,7 @@ impl Orchestrator {
             );
         }
 
-        // Install Claude Code CLI (skip if using a custom template that has it)
+        // Install Claude Code CLI if not present
         let check = self.e2b.exec(sid, "which claude", 10, None).await;
         if check.is_err() || check.as_ref().is_ok_and(|r| r.exit_code != 0) {
             tracing::info!(workflow_id = %record.workflow_id, "Installing Claude Code CLI...");
@@ -349,7 +341,8 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Run Claude Code in plan mode to generate the initial plan.
+    // ── Claude Code phases ────────────────────────────────────────
+
     async fn generate_plan(&self, record: &mut WorkflowRecord) -> anyhow::Result<()> {
         let sid = record
             .sandbox_id
@@ -374,9 +367,9 @@ impl Orchestrator {
 
         if result.exit_code != 0 {
             let detail = if result.stderr.is_empty() {
-                result.stdout.clone()
+                &result.stdout
             } else {
-                result.stderr.clone()
+                &result.stderr
             };
             anyhow::bail!(
                 "Claude Code plan failed (exit {}): {}",
@@ -385,26 +378,22 @@ impl Orchestrator {
             );
         }
 
-        // Parse JSON response
         let (plan_text, session_id) = parse_claude_output(&result.stdout)?;
         record.plan_text = Some(plan_text.clone());
         record.session_id = session_id;
 
-        // Post to Slack (top-level message — we don't have thread_ts yet)
+        // Post plan to Slack and capture the message ts for threading
         let message_text =
             slack_bridge::format_plan_message(&record.repo_url, &record.task, &plan_text);
-        let msg = SendMessage::new(&message_text, &record.slack_channel);
-        self.channel.send(&msg).await?;
-
-        // Note: Channel::send() doesn't return the Slack message ts, so we
-        // can't thread follow-up messages yet. Future improvement: extend the
-        // Channel trait to return message metadata. For now, all messages go
-        // to the channel root.
+        let ts = self
+            .post_slack_message(&record.slack_channel, &message_text)
+            .await?;
+        record.slack_thread_ts = Some(ts);
+        let _ = record.save(&self.workflows_dir);
 
         Ok(())
     }
 
-    /// Revise the plan based on user feedback.
     async fn revise_plan(&self, record: &mut WorkflowRecord, feedback: &str) -> anyhow::Result<()> {
         let sid = record
             .sandbox_id
@@ -412,9 +401,8 @@ impl Orchestrator {
             .ok_or_else(|| anyhow::anyhow!("No sandbox"))?;
 
         let escaped_feedback = feedback.replace('\'', "'\\''");
-        let mut cmd = format!(
-            "claude -p '{escaped_feedback}' --permission-mode plan --output-format json"
-        );
+        let mut cmd =
+            format!("claude -p '{escaped_feedback}' --permission-mode plan --output-format json");
 
         if let Some(ref sess_id) = record.session_id {
             use std::fmt::Write;
@@ -432,10 +420,15 @@ impl Orchestrator {
             .await?;
 
         if result.exit_code != 0 {
+            let detail = if result.stderr.is_empty() {
+                &result.stdout
+            } else {
+                &result.stderr
+            };
             anyhow::bail!(
                 "Claude Code revision failed (exit {}): {}",
                 result.exit_code,
-                result.stderr
+                detail
             );
         }
 
@@ -446,19 +439,13 @@ impl Orchestrator {
         }
         record.iteration_count += 1;
 
-        // Post revised plan to thread
         let message_text = slack_bridge::format_revised_plan(&plan_text, record.iteration_count);
-        self.send_thread_message(record, &message_text).await;
+        self.post_slack_thread_message(record, &message_text).await;
 
         Ok(())
     }
 
-    /// Execute the approved plan.
-    async fn execute_plan(
-        &self,
-        record: &mut WorkflowRecord,
-        rx: &mut mpsc::Receiver<ThreadMessage>,
-    ) -> anyhow::Result<()> {
+    async fn execute_plan(&self, record: &mut WorkflowRecord) -> anyhow::Result<()> {
         let sid = record
             .sandbox_id
             .as_deref()
@@ -482,63 +469,17 @@ impl Orchestrator {
             .await?;
 
         if result.exit_code != 0 {
-            // Check if Claude Code is asking a question
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&result.stdout) {
-                if let Some(question) = extract_question(&json) {
-                    // Forward question to Slack
-                    self.send_thread_message(record, &slack_bridge::format_question(&question))
-                        .await;
-
-                    // Wait for answer
-                    let timeout =
-                        tokio::time::Duration::from_secs(self.config.approval_timeout_secs);
-                    match tokio::time::timeout(timeout, rx.recv()).await {
-                        Ok(Some(answer)) => {
-                            // Resume with the answer
-                            let escaped = answer.text.replace('\'', "'\\''");
-                            let resume_cmd = format!(
-                                "claude -p '{escaped}' --resume {} --dangerously-skip-permissions --output-format json",
-                                record.session_id.as_deref().unwrap_or("")
-                            );
-                            let resume_result = self
-                                .e2b
-                                .exec(
-                                    sid,
-                                    &resume_cmd,
-                                    self.config.exec_timeout_secs,
-                                    Some("/home/user/project"),
-                                )
-                                .await?;
-                            if resume_result.exit_code != 0 {
-                                anyhow::bail!(
-                                    "Execution failed after answer (exit {}): {}",
-                                    resume_result.exit_code,
-                                    resume_result.stderr
-                                );
-                            }
-                        }
-                        _ => anyhow::bail!("No answer received for Claude Code question"),
-                    }
-                } else {
-                    anyhow::bail!(
-                        "Execution failed (exit {}): {}",
-                        result.exit_code,
-                        result.stderr
-                    );
-                }
+            let detail = if result.stderr.is_empty() {
+                &result.stdout
             } else {
-                anyhow::bail!(
-                    "Execution failed (exit {}): {}",
-                    result.exit_code,
-                    result.stderr
-                );
-            }
+                &result.stderr
+            };
+            anyhow::bail!("Execution failed (exit {}): {}", result.exit_code, detail);
         }
 
         Ok(())
     }
 
-    /// Create a PR from the sandbox's changes.
     async fn create_pr(&self, record: &mut WorkflowRecord) -> anyhow::Result<()> {
         let sid = record
             .sandbox_id
@@ -557,18 +498,14 @@ impl Orchestrator {
                 project_dir,
             )
             .await?;
-        // Branch may already exist if Claude Code created one
         if result.exit_code != 0 && !result.stderr.contains("already exists") {
-            // Try switching to it
             self.e2b
                 .exec(sid, &format!("git checkout {branch_name}"), 30, project_dir)
                 .await?;
         }
 
-        // Stage any uncommitted changes
+        // Stage + commit
         self.e2b.exec(sid, "git add -A", 30, project_dir).await?;
-
-        // Commit (may be empty if Claude Code already committed)
         let commit_msg = format!("feat: {}", truncate(&record.task, 60));
         let escaped_msg = commit_msg.replace('\'', "'\\''");
         let _ = self
@@ -595,7 +532,7 @@ impl Orchestrator {
             anyhow::bail!("git push failed: {}", push_result.stderr);
         }
 
-        // Create PR
+        // Create PR — use `bash -lc` so .bashrc is sourced (GH_TOKEN)
         let pr_title = truncate(&record.task, 70);
         let escaped_title = pr_title.replace('\'', "'\\''");
         let pr_body = format!(
@@ -607,7 +544,9 @@ impl Orchestrator {
             .e2b
             .exec(
                 sid,
-                &format!("gh pr create --title '{escaped_title}' --body '{escaped_body}'"),
+                &format!(
+                    "bash -lc \"gh pr create --title '{escaped_title}' --body '{escaped_body}'\""
+                ),
                 60,
                 project_dir,
             )
@@ -617,60 +556,141 @@ impl Orchestrator {
             anyhow::bail!("gh pr create failed: {}", pr_result.stderr);
         }
 
-        // Extract PR URL from stdout (gh prints the URL)
         let pr_url = pr_result.stdout.trim().to_string();
         record.pr_url = Some(pr_url);
 
         Ok(())
     }
 
-    /// Transition to failed state, notify Slack, and cleanup.
+    // ── Slack Web API (direct calls for threading) ────────────────
+
+    /// Post a message to a Slack channel and return the message ts.
+    async fn post_slack_message(&self, channel: &str, text: &str) -> anyhow::Result<String> {
+        let resp = self
+            .http
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&self.slack_bot_token)
+            .json(&serde_json::json!({
+                "channel": channel,
+                "text": text,
+            }))
+            .send()
+            .await?;
+
+        let body: serde_json::Value = resp.json().await?;
+        if body["ok"].as_bool() != Some(true) {
+            let err = body["error"].as_str().unwrap_or("unknown");
+            anyhow::bail!("Slack chat.postMessage failed: {err}");
+        }
+
+        body["ts"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("Slack response missing ts"))
+    }
+
+    /// Post a reply in a Slack thread.
+    async fn post_slack_reply(&self, channel: &str, thread_ts: &str, text: &str) {
+        let result = self
+            .http
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&self.slack_bot_token)
+            .json(&serde_json::json!({
+                "channel": channel,
+                "text": text,
+                "thread_ts": thread_ts,
+            }))
+            .send()
+            .await;
+
+        if let Err(e) = result {
+            tracing::warn!(error = %e, "Failed to post Slack reply");
+        }
+    }
+
+    /// Post a message in the workflow's Slack thread (or channel if no thread).
+    async fn post_slack_thread_message(&self, record: &WorkflowRecord, text: &str) {
+        if let Some(ref thread_ts) = record.slack_thread_ts {
+            self.post_slack_reply(&record.slack_channel, thread_ts, text)
+                .await;
+        } else {
+            let _ = self.post_slack_message(&record.slack_channel, text).await;
+        }
+    }
+
+    /// Poll for new replies in a Slack thread since `oldest_ts`.
+    /// Returns vec of (ts, text) for messages from non-bot users.
+    async fn poll_slack_replies(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        oldest_ts: &str,
+    ) -> Vec<(String, String)> {
+        let resp = self
+            .http
+            .get("https://slack.com/api/conversations.replies")
+            .bearer_auth(&self.slack_bot_token)
+            .query(&[
+                ("channel", channel),
+                ("ts", thread_ts),
+                ("oldest", oldest_ts),
+            ])
+            .send()
+            .await;
+
+        let body: serde_json::Value = match resp {
+            Ok(r) => match r.json().await {
+                Ok(b) => b,
+                Err(_) => return Vec::new(),
+            },
+            Err(_) => return Vec::new(),
+        };
+
+        if body["ok"].as_bool() != Some(true) {
+            return Vec::new();
+        }
+
+        body["messages"]
+            .as_array()
+            .map(|msgs| {
+                msgs.iter()
+                    .filter(|m| {
+                        // Skip bot messages and the thread root
+                        let ts = m["ts"].as_str().unwrap_or("");
+                        let is_bot = m.get("bot_id").is_some();
+                        let is_root = ts == thread_ts;
+                        let is_old = ts <= oldest_ts;
+                        !is_bot && !is_root && !is_old
+                    })
+                    .filter_map(|m| {
+                        let ts = m["ts"].as_str()?.to_string();
+                        let text = m["text"].as_str()?.to_string();
+                        Some((ts, text))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // ── Lifecycle helpers ─────────────────────────────────────────
+
     async fn fail(&self, record: &mut WorkflowRecord, reason: &str) {
-        tracing::error!(
-            workflow_id = %record.workflow_id,
-            reason = %reason,
-            "Workflow failed"
-        );
+        tracing::error!(workflow_id = %record.workflow_id, reason = %reason, "Workflow failed");
         record.transition(WorkflowState::Failed {
             reason: reason.to_string(),
         });
         let _ = record.save(&self.workflows_dir);
 
-        self.send_thread_message(record, &slack_bridge::format_failure(reason))
+        self.post_slack_thread_message(record, &slack_bridge::format_failure(reason))
             .await;
         self.cleanup(record).await;
     }
 
-    /// Destroy sandbox and unregister thread.
     async fn cleanup(&self, record: &WorkflowRecord) {
         if let Some(ref sid) = record.sandbox_id {
             if let Err(e) = self.e2b.destroy(sid).await {
                 tracing::warn!(sandbox_id = %sid, error = %e, "Failed to destroy sandbox");
             }
-        }
-        if let Some(ref thread_ts) = record.slack_thread_ts {
-            self.router
-                .unregister(&record.slack_channel, thread_ts)
-                .await;
-        }
-    }
-
-    /// Send a message in the workflow's Slack channel (threaded if we have a real thread_ts).
-    async fn send_thread_message(&self, record: &WorkflowRecord, text: &str) {
-        // Only use thread_ts if it's a real Slack timestamp (contains a dot),
-        // not our placeholder format.
-        let thread_ts = record
-            .slack_thread_ts
-            .as_deref()
-            .filter(|ts| ts.contains('.'))
-            .map(String::from);
-        let msg = SendMessage::new(text, &record.slack_channel).in_thread(thread_ts);
-        if let Err(e) = self.channel.send(&msg).await {
-            tracing::warn!(
-                workflow_id = %record.workflow_id,
-                error = %e,
-                "Failed to send Slack message"
-            );
         }
     }
 }
@@ -679,7 +699,7 @@ impl Orchestrator {
 fn parse_claude_output(stdout: &str) -> anyhow::Result<(String, Option<String>)> {
     let json: serde_json::Value = serde_json::from_str(stdout).map_err(|e| {
         anyhow::anyhow!(
-            "Failed to parse Claude Code output as JSON: {e}\nRaw output: {}",
+            "Failed to parse Claude Code output as JSON: {e}\nRaw: {}",
             truncate(stdout, 500)
         )
     })?;
@@ -696,23 +716,12 @@ fn parse_claude_output(stdout: &str) -> anyhow::Result<(String, Option<String>)>
         .map(String::from);
 
     if result_text.is_empty() {
-        // Fall back to raw stdout if no result key
         return Ok((stdout.to_string(), session_id));
     }
 
     Ok((result_text, session_id))
 }
 
-/// Try to extract a question from Claude Code's output (e.g. AskUserQuestion).
-fn extract_question(json: &serde_json::Value) -> Option<String> {
-    // Claude Code may surface questions in the result text or as a specific field
-    json.get("result")
-        .and_then(|v| v.as_str())
-        .filter(|text| text.contains('?'))
-        .map(String::from)
-}
-
-/// Truncate a string to a max length, adding "..." if truncated.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -742,7 +751,6 @@ mod tests {
     fn parse_claude_output_no_result_key() {
         let json = r#"{"text": "something else"}"#;
         let (result, session_id) = parse_claude_output(json).unwrap();
-        // Falls back to raw stdout
         assert!(result.contains("something else"));
         assert!(session_id.is_none());
     }
