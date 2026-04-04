@@ -3711,6 +3711,11 @@ pub struct SandboxWorkflowConfig {
     /// Required for Slack integration. Use the same `xoxb-...` token as `channels_config.slack`.
     #[serde(default)]
     pub slack_bot_token: Option<String>,
+    /// Directory to sync into the sandbox's `~/.claude/` for skills, MCP config, etc.
+    /// Supports `settings.json`, `skills/*.md`, and any other Claude Code config files.
+    /// Credentials (`.credentials.json`) are handled separately via `claude_credentials_path`.
+    #[serde(default)]
+    pub claude_config_dir: Option<String>,
 }
 
 fn default_sandbox_e2b_api_url() -> String {
@@ -3755,6 +3760,7 @@ impl Default for SandboxWorkflowConfig {
             git_user_email: None,
             claude_credentials_path: None,
             slack_bot_token: None,
+            claude_config_dir: None,
         }
     }
 }

@@ -267,6 +267,23 @@ impl Orchestrator {
             }
         }
 
+        // Sync Claude Code config directory (skills, settings.json, etc.)
+        if let Some(ref config_dir) = self.config.claude_config_dir {
+            let config_path = std::path::Path::new(config_dir);
+            if config_path.is_dir() {
+                match sync_dir_to_sandbox(&self.e2b, sid, config_path, "/home/user/.claude").await {
+                    Ok(count) => {
+                        tracing::info!(count, "Synced Claude Code config files into sandbox");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to sync Claude Code config dir");
+                    }
+                }
+            } else {
+                tracing::warn!(path = %config_dir, "claude_config_dir does not exist or is not a directory");
+            }
+        }
+
         // Configure git
         if let Some(ref name) = self.config.git_user_name {
             self.e2b
@@ -349,9 +366,12 @@ impl Orchestrator {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("No sandbox"))?;
 
+        // Note: --permission-mode plan is incompatible with -p (non-interactive).
+        // Instead, use --dangerously-skip-permissions with a prompt that instructs
+        // Claude Code to only analyze and plan, not make changes.
         let escaped_task = record.task.replace('\'', "'\\''");
         let cmd = format!(
-            "claude -p '{}' --permission-mode plan --output-format json",
+            "claude -p 'Analyze this codebase and create a detailed plan for the following task. Do NOT make any changes yet — only read files and describe what you would do, which files you would modify, and what the changes would be.\n\nTask: {}' --dangerously-skip-permissions --output-format json",
             escaped_task
         );
 
@@ -401,8 +421,9 @@ impl Orchestrator {
             .ok_or_else(|| anyhow::anyhow!("No sandbox"))?;
 
         let escaped_feedback = feedback.replace('\'', "'\\''");
-        let mut cmd =
-            format!("claude -p '{escaped_feedback}' --permission-mode plan --output-format json");
+        let mut cmd = format!(
+            "claude -p 'Revise the plan based on this feedback. Do NOT make any changes yet — only update your plan.\n\nFeedback: {escaped_feedback}' --dangerously-skip-permissions --output-format json"
+        );
 
         if let Some(ref sess_id) = record.session_id {
             use std::fmt::Write;
@@ -532,7 +553,8 @@ impl Orchestrator {
             anyhow::bail!("git push failed: {}", push_result.stderr);
         }
 
-        // Create PR — use `bash -lc` so .bashrc is sourced (GH_TOKEN)
+        // Create PR — pass GH_TOKEN inline since .bashrc isn't sourced by exec
+        let gh_token = std::env::var("GH_TOKEN").unwrap_or_default();
         let pr_title = truncate(&record.task, 70);
         let escaped_title = pr_title.replace('\'', "'\\''");
         let pr_body = format!(
@@ -545,7 +567,7 @@ impl Orchestrator {
             .exec(
                 sid,
                 &format!(
-                    "bash -lc \"gh pr create --title '{escaped_title}' --body '{escaped_body}'\""
+                    "GH_TOKEN={gh_token} gh pr create --title '{escaped_title}' --body '{escaped_body}'"
                 ),
                 60,
                 project_dir,
@@ -693,6 +715,63 @@ impl Orchestrator {
             }
         }
     }
+}
+
+/// Recursively sync a local directory into the sandbox at `dest_base`.
+/// Skips `.credentials.json` (handled separately), sessions, and caches.
+async fn sync_dir_to_sandbox(
+    e2b: &E2bClient,
+    sandbox_id: &str,
+    local_dir: &std::path::Path,
+    dest_base: &str,
+) -> anyhow::Result<usize> {
+    use std::fs;
+
+    const SKIP_NAMES: &[&str] = &[
+        ".credentials.json",
+        "sessions",
+        "session-env",
+        "statsig",
+        "cache",
+        ".cache",
+        "history.jsonl",
+    ];
+
+    let mut count = 0;
+    let mut stack = vec![(local_dir.to_path_buf(), dest_base.to_string())];
+
+    while let Some((dir, dest_dir)) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            if SKIP_NAMES.iter().any(|s| *s == name_str.as_ref()) {
+                continue;
+            }
+
+            let path = entry.path();
+            let dest_path = format!("{}/{}", dest_dir, name_str);
+
+            if path.is_dir() {
+                stack.push((path, dest_path));
+            } else if path.is_file() {
+                if let Ok(content) = fs::read_to_string(&path) {
+                    if let Err(e) = e2b.write_file(sandbox_id, &dest_path, &content).await {
+                        tracing::warn!(path = %dest_path, error = %e, "Failed to sync file");
+                    } else {
+                        count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(count)
 }
 
 /// Parse Claude Code JSON output to extract the result text and session_id.
