@@ -361,7 +361,10 @@ impl Orchestrator {
         }
 
         // Register OAuth MCP servers from credentials (PostHog, SigNoz, etc.)
-        // Must run after Claude Code is installed since it uses `claude mcp add`.
+        // Must run after Claude Code is installed AND repo is cloned, since
+        // `claude mcp add` saves config to the cwd and Claude Code only finds
+        // it when running from that same directory.
+        let project_dir = Some("/home/user/project");
         if creds_path.exists() {
             if let Ok(creds_str) = std::fs::read_to_string(&creds_path) {
                 if let Ok(creds_json) = serde_json::from_str::<serde_json::Value>(&creds_str) {
@@ -384,7 +387,7 @@ impl Orchestrator {
                                 let cmd = format!(
                                     "claude mcp add --transport http {name} {url} --header 'Authorization: Bearer {token}'"
                                 );
-                                match self.e2b.exec(sid, &cmd, 15, None).await {
+                                match self.e2b.exec(sid, &cmd, 15, project_dir).await {
                                     Ok(r) if r.exit_code == 0 => {
                                         tracing::info!(name, "Registered OAuth MCP server");
                                     }
