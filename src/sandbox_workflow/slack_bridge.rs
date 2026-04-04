@@ -19,10 +19,21 @@ const APPROVAL_KEYWORDS: &[&str] = &[
     "approve", "approved", "lgtm", "ship it", "go", "execute", "run it",
 ];
 
+/// Cancel keywords.
+const CANCEL_KEYWORDS: &[&str] = &["cancel", "abort", "stop", "nevermind", "never mind"];
+
 /// Check if a message is an approval.
 pub fn is_approval(text: &str) -> bool {
     let normalized = text.trim().to_lowercase();
     APPROVAL_KEYWORDS.iter().any(|kw| {
+        normalized == *kw || normalized == format!("{kw}!") || normalized == format!("{kw}.")
+    })
+}
+
+/// Check if a message is a cancellation.
+pub fn is_cancel(text: &str) -> bool {
+    let normalized = text.trim().to_lowercase();
+    CANCEL_KEYWORDS.iter().any(|kw| {
         normalized == *kw || normalized == format!("{kw}!") || normalized == format!("{kw}.")
     })
 }

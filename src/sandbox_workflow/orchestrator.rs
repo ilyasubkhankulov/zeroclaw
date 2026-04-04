@@ -134,6 +134,11 @@ impl Orchestrator {
             for (ts, text) in replies {
                 last_seen_ts = ts;
 
+                if slack_bridge::is_cancel(&text) {
+                    self.fail(&mut record, "Cancelled by user").await;
+                    return Ok(());
+                }
+
                 if slack_bridge::is_approval(&text) {
                     self.post_slack_reply(
                         &record.slack_channel,
