@@ -449,14 +449,19 @@ impl Orchestrator {
         record.plan_text = Some(plan_text.clone());
         record.session_id = session_id;
 
-        // Post plan to Slack and capture the message ts for threading
-        let message_text =
-            slack_bridge::format_plan_message(&record.repo_url, &record.task, &plan_text);
+        // Post short summary to channel, full plan as thread reply
+        let summary =
+            slack_bridge::format_plan_summary(&record.workflow_id, &record.repo_url, &record.task);
         let ts = self
-            .post_slack_message(&record.slack_channel, &message_text)
+            .post_slack_message(&record.slack_channel, &summary)
             .await?;
-        record.slack_thread_ts = Some(ts);
+        record.slack_thread_ts = Some(ts.clone());
         let _ = record.save(&self.workflows_dir);
+
+        // Post full plan in the thread
+        let detail = slack_bridge::format_plan_detail(&plan_text);
+        self.post_slack_reply(&record.slack_channel, &ts, &detail)
+            .await;
 
         Ok(())
     }

@@ -38,24 +38,25 @@ pub fn is_cancel(text: &str) -> bool {
     })
 }
 
-/// Format a plan for posting to Slack.
-pub fn format_plan_message(repo_url: &str, task: &str, plan_text: &str) -> String {
+/// Format the short channel message (low footprint).
+pub fn format_plan_summary(workflow_id: &str, repo_url: &str, task: &str) -> String {
+    // Extract repo name from URL
+    let repo_name = repo_url.rsplit('/').next().unwrap_or(repo_url);
     format!(
-        "*Sandbox Coding Plan* for `{repo_url}`\n\
-         *Task:* {task}\n\n\
-         ---\n\
-         {plan_text}\n\
-         ---\n\n\
-         Reply in this thread to refine the plan.\n\
-         Reply *approve* or *lgtm* to execute."
+        "*Sandbox `{workflow_id}`* — {task}\n\
+         Repo: `{repo_name}` | Reply in thread: *lgtm* to approve, *cancel* to abort"
     )
+}
+
+/// Format the full plan (posted as a thread reply).
+pub fn format_plan_detail(plan_text: &str) -> String {
+    format!("*Plan:*\n\n{plan_text}")
 }
 
 /// Format a revised plan update.
 pub fn format_revised_plan(plan_text: &str, iteration: u32) -> String {
     format!(
         "*Revised Plan* (iteration {iteration})\n\n\
-         ---\n\
          {plan_text}\n\
          ---\n\n\
          Reply to refine further, or *approve* to execute."
