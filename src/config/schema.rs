@@ -3716,6 +3716,15 @@ pub struct SandboxWorkflowConfig {
     /// Credentials (`.credentials.json`) are handled separately via `claude_credentials_path`.
     #[serde(default)]
     pub claude_config_dir: Option<String>,
+    /// GitHub App ID for automated git operations (replaces personal access tokens).
+    #[serde(default)]
+    pub github_app_id: Option<String>,
+    /// Path to the GitHub App private key PEM file.
+    #[serde(default)]
+    pub github_app_private_key_path: Option<String>,
+    /// GitHub App installation ID for the target org/repos.
+    #[serde(default)]
+    pub github_app_installation_id: Option<u64>,
 }
 
 fn default_sandbox_e2b_api_url() -> String {
@@ -3761,6 +3770,9 @@ impl Default for SandboxWorkflowConfig {
             claude_credentials_path: None,
             slack_bot_token: None,
             claude_config_dir: None,
+            github_app_id: None,
+            github_app_private_key_path: None,
+            github_app_installation_id: None,
         }
     }
 }

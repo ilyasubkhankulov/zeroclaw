@@ -9,6 +9,7 @@
 //! 6. Tear down the sandbox
 
 pub mod e2b_client;
+pub mod github_app;
 pub mod orchestrator;
 pub mod slack_bridge;
 pub mod state;

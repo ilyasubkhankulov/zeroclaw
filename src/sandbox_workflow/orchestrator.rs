@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::e2b_client::E2bClient;
+use super::github_app::GitHubAppAuth;
 use super::slack_bridge;
 use super::state::{TaskType, WorkflowRecord, WorkflowState};
 
@@ -29,6 +30,7 @@ pub struct Orchestrator {
     e2b: E2bClient,
     http: Client,
     slack_bot_token: String,
+    github_app: Option<GitHubAppAuth>,
     workflows_dir: PathBuf,
 }
 
@@ -44,11 +46,33 @@ impl Orchestrator {
         let http = Client::new();
         let slack_bot_token = config.slack_bot_token.clone().unwrap_or_default();
 
+        // Initialize GitHub App auth if configured (preferred over GH_TOKEN)
+        let github_app = match (
+            config.github_app_id.as_deref(),
+            config.github_app_private_key_path.as_deref(),
+            config.github_app_installation_id,
+        ) {
+            (Some(id), Some(key_path), Some(install_id)) => {
+                match GitHubAppAuth::from_config(id, key_path, install_id) {
+                    Ok(auth) => {
+                        tracing::info!("GitHub App auth configured (app_id={id})");
+                        Some(auth)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "GitHub App auth failed to initialize, falling back to GH_TOKEN");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         Self {
             config,
             e2b,
             http,
             slack_bot_token,
+            github_app,
             workflows_dir,
         }
     }
@@ -456,10 +480,14 @@ impl Orchestrator {
     async fn initialize_sandbox(&self, record: &mut WorkflowRecord) -> anyhow::Result<()> {
         let mut envs = std::collections::HashMap::new();
 
-        for var in &["ANTHROPIC_API_KEY", "API_KEY", "GH_TOKEN", "GITHUB_TOKEN"] {
+        for var in &["ANTHROPIC_API_KEY", "API_KEY"] {
             if let Ok(val) = std::env::var(var) {
                 envs.insert((*var).into(), val);
             }
+        }
+        // Get GitHub token from App (preferred) or env var
+        if let Some(gh_token) = self.get_github_token().await {
+            envs.insert("GH_TOKEN".into(), gh_token);
         }
         for var in &self.config.env_passthrough {
             if let Ok(val) = std::env::var(var) {
@@ -545,15 +573,13 @@ impl Orchestrator {
         }
 
         // Configure git + gh auth for private repos.
-        // Write GH_TOKEN to sandbox profile so all commands can access it,
-        // and configure git URL rewriting for clone auth.
-        if let Ok(gh_token) = std::env::var("GH_TOKEN") {
+        // Configure git URL rewriting for clone/push auth using GitHub token.
+        if let Some(gh_token) = self.get_github_token().await {
             self.e2b
                 .exec(
                     sid,
                     &format!(
-                        "echo 'export GH_TOKEN={gh_token}' >> /home/user/.bashrc && \
-                         git config --global url.'https://{gh_token}@github.com/'.insteadOf 'https://github.com/'"
+                        "git config --global url.'https://x-access-token:{gh_token}@github.com/'.insteadOf 'https://github.com/'"
                     ),
                     30,
                     None,
@@ -562,7 +588,12 @@ impl Orchestrator {
         }
 
         // Clone repo (skip for data/admin tasks with no repo)
-        if !record.repo_url.is_empty() {
+        if record.repo_url.is_empty() {
+            // Create project dir even without a repo
+            self.e2b
+                .exec(sid, "mkdir -p /home/user/project", 10, None)
+                .await?;
+        } else {
             let branch_flag = record
                 .base_branch
                 .as_deref()
@@ -580,11 +611,6 @@ impl Orchestrator {
                     result.stderr
                 );
             }
-        } else {
-            // Create project dir even without a repo
-            self.e2b
-                .exec(sid, "mkdir -p /home/user/project", 10, None)
-                .await?;
         }
 
         // Install Claude Code CLI if not present
@@ -836,8 +862,8 @@ impl Orchestrator {
             anyhow::bail!("git push failed: {}", push_result.stderr);
         }
 
-        // Create PR — pass GH_TOKEN inline since .bashrc isn't sourced by exec
-        let gh_token = std::env::var("GH_TOKEN").unwrap_or_default();
+        // Create PR — generate a fresh token (App tokens are short-lived)
+        let gh_token = self.get_github_token().await.unwrap_or_default();
         let pr_title = truncate(&record.task, 70);
         let escaped_title = pr_title.replace('\'', "'\\''");
         let pr_body = format!(
@@ -975,6 +1001,24 @@ impl Orchestrator {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Get a GitHub token — from GitHub App (preferred) or GH_TOKEN env var.
+    async fn get_github_token(&self) -> Option<String> {
+        if let Some(ref app) = self.github_app {
+            match app.get_installation_token().await {
+                Ok(token) => {
+                    tracing::info!("Generated GitHub App installation token");
+                    return Some(token);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "GitHub App token generation failed");
+                }
+            }
+        }
+        std::env::var("GH_TOKEN")
+            .ok()
+            .or_else(|| std::env::var("GITHUB_TOKEN").ok())
     }
 
     // ── Lifecycle helpers ─────────────────────────────────────────
