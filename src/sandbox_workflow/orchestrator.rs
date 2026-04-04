@@ -289,6 +289,49 @@ impl Orchestrator {
             }
         }
 
+        // Register OAuth MCP servers from credentials (PostHog, SigNoz, etc.)
+        // Claude Code needs them added via `claude mcp add --transport http` with
+        // their OAuth access tokens as auth headers.
+        if creds_path.exists() {
+            if let Ok(creds_str) = std::fs::read_to_string(&creds_path) {
+                if let Ok(creds_json) = serde_json::from_str::<serde_json::Value>(&creds_str) {
+                    if let Some(mcp_oauth) = creds_json.get("mcpOAuth").and_then(|v| v.as_object())
+                    {
+                        for (_key, val) in mcp_oauth {
+                            let name = val
+                                .get("serverName")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            let url = val
+                                .get("serverUrl")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            let token = val
+                                .get("accessToken")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            if !name.is_empty() && !url.is_empty() && !token.is_empty() {
+                                let cmd = format!(
+                                    "claude mcp add --transport http {name} {url} --header 'Authorization: Bearer {token}'"
+                                );
+                                match self.e2b.exec(sid, &cmd, 15, None).await {
+                                    Ok(r) if r.exit_code == 0 => {
+                                        tracing::info!(name, "Registered OAuth MCP server");
+                                    }
+                                    Ok(r) => {
+                                        tracing::warn!(name, stderr = %r.stderr, "Failed to add MCP server");
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(name, error = %e, "Failed to add MCP server");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Configure git
         if let Some(ref name) = self.config.git_user_name {
             self.e2b
