@@ -2,6 +2,44 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Task type determines the workflow shape.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskType {
+    /// Analyze code in a repo, post findings to Slack. No approval, no PR.
+    Research,
+    /// Query data via MCP tools (PostHog, SigNoz, etc.), post results. No repo, no approval, no PR.
+    Data,
+    /// Run admin API calls via MCP tools. Requires approval before executing. No PR.
+    Admin,
+    /// Make code changes in a repo, create a PR. Requires plan approval.
+    #[default]
+    Eng,
+}
+
+impl TaskType {
+    pub fn needs_repo(&self) -> bool {
+        matches!(self, Self::Research | Self::Eng)
+    }
+
+    pub fn needs_approval(&self) -> bool {
+        matches!(self, Self::Admin | Self::Eng)
+    }
+
+    pub fn creates_pr(&self) -> bool {
+        matches!(self, Self::Eng)
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Research => "Research",
+            Self::Data => "Data query",
+            Self::Admin => "Admin",
+            Self::Eng => "Sandbox",
+        }
+    }
+}
+
 /// States in the sandbox coding workflow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +87,8 @@ impl WorkflowState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowRecord {
     pub workflow_id: String,
+    #[serde(default)]
+    pub task_type: TaskType,
     pub state: WorkflowState,
     pub sandbox_id: Option<String>,
     /// Claude Code session ID for `--resume`.
@@ -71,6 +111,7 @@ impl WorkflowRecord {
         let now = chrono::Utc::now().to_rfc3339();
         Self {
             workflow_id,
+            task_type: TaskType::default(),
             state: WorkflowState::Initializing,
             sandbox_id: None,
             session_id: None,

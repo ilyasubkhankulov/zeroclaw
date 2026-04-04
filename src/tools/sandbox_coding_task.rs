@@ -1,13 +1,14 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::SandboxWorkflowConfig;
+use crate::sandbox_workflow::state::TaskType;
 use crate::sandbox_workflow::{Orchestrator, WorkflowParams};
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Kicks off a sandbox coding workflow: E2B sandbox + Claude Code plan mode +
-/// Slack iteration + PR creation.
+/// Kicks off a sandbox workflow: E2B sandbox + Claude Code + Slack interaction.
+/// Supports research, data, admin, and eng (PR) task types.
 pub struct SandboxCodingTaskTool {
     config: SandboxWorkflowConfig,
     workspace_dir: PathBuf,
@@ -29,7 +30,11 @@ impl Tool for SandboxCodingTaskTool {
     }
 
     fn description(&self) -> &str {
-        "Start a sandboxed coding task: spins up an E2B cloud sandbox, runs Claude Code in plan mode, posts the plan to Slack for review, executes on approval, and creates a GitHub PR. Returns immediately with a workflow ID."
+        "Run a task in a cloud sandbox with Claude Code and MCP tools. Supports four types:\n\
+         - research: analyze code in a repo, post findings to Slack\n\
+         - data: query data via MCP tools (PostHog, SigNoz), post results to Slack\n\
+         - admin: run admin API calls via MCP tools (requires approval), post results\n\
+         - eng: make code changes in a repo, create a GitHub PR (requires plan approval)"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -38,22 +43,27 @@ impl Tool for SandboxCodingTaskTool {
             "properties": {
                 "task": {
                     "type": "string",
-                    "description": "The coding task to accomplish"
+                    "description": "The task to accomplish"
+                },
+                "task_type": {
+                    "type": "string",
+                    "enum": ["research", "data", "admin", "eng"],
+                    "description": "research = analyze code, data = query analytics/MCP, admin = run admin API calls (approval required), eng = code changes + PR (approval required)"
                 },
                 "repo_url": {
                     "type": "string",
-                    "description": "Git repository URL to clone (e.g. https://github.com/user/repo)"
+                    "description": "Git repo URL (required for research/eng, optional for data/admin)"
                 },
                 "slack_channel": {
                     "type": "string",
-                    "description": "Slack channel ID for plan review thread (falls back to config default)"
+                    "description": "Slack channel ID (falls back to config default)"
                 },
                 "branch": {
                     "type": "string",
                     "description": "Base branch to work from (default: repo default branch)"
                 }
             },
-            "required": ["task", "repo_url"]
+            "required": ["task", "task_type"]
         })
     }
 
@@ -64,11 +74,41 @@ impl Tool for SandboxCodingTaskTool {
             .ok_or_else(|| anyhow::anyhow!("Missing 'task' parameter"))?
             .to_string();
 
+        let task_type = match args.get("task_type").and_then(|v| v.as_str()) {
+            Some("research") => TaskType::Research,
+            Some("data") => TaskType::Data,
+            Some("admin") => TaskType::Admin,
+            Some("eng") | None => TaskType::Eng,
+            Some(other) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Invalid task_type '{other}'. Must be: research, data, admin, or eng"
+                    )),
+                });
+            }
+        };
+
         let repo_url = args
             .get("repo_url")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'repo_url' parameter"))?
+            .unwrap_or("")
             .to_string();
+
+        // Validate repo_url requirement
+        if task_type.needs_repo() && repo_url.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "task_type '{}' requires a repo_url",
+                    args.get("task_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("eng")
+                )),
+            });
+        }
 
         let slack_channel = args
             .get("slack_channel")
@@ -102,8 +142,10 @@ impl Tool for SandboxCodingTaskTool {
 
         let orchestrator = Arc::new(Orchestrator::new(self.config.clone(), &self.workspace_dir));
 
+        let type_label = task_type.label().to_string();
         let params = WorkflowParams {
             task,
+            task_type,
             repo_url,
             slack_channel,
             base_branch: branch,
@@ -114,7 +156,7 @@ impl Tool for SandboxCodingTaskTool {
         Ok(ToolResult {
             success: true,
             output: format!(
-                "Sandbox coding workflow started.\nWorkflow ID: {workflow_id}\nCheck Slack for the plan."
+                "{type_label} workflow started.\nWorkflow ID: {workflow_id}\nCheck Slack for updates."
             ),
             error: None,
         })

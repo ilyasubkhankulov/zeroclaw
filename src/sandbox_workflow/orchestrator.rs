@@ -12,11 +12,12 @@ use std::sync::Arc;
 
 use super::e2b_client::E2bClient;
 use super::slack_bridge;
-use super::state::{WorkflowRecord, WorkflowState};
+use super::state::{TaskType, WorkflowRecord, WorkflowState};
 
 /// Parameters for launching a new workflow.
 pub struct WorkflowParams {
     pub task: String,
+    pub task_type: TaskType,
     pub repo_url: String,
     pub slack_channel: String,
     pub base_branch: Option<String>,
@@ -62,6 +63,7 @@ impl Orchestrator {
             params.task,
             params.slack_channel,
         );
+        record.task_type = params.task_type;
         record.base_branch = params.base_branch;
 
         let orchestrator = Arc::clone(&self);
@@ -76,12 +78,17 @@ impl Orchestrator {
         workflow_id
     }
 
-    /// Run the full workflow state machine.
+    /// Run the workflow — branches by task type.
     async fn run_workflow(&self, mut record: WorkflowRecord) -> anyhow::Result<()> {
         let _ = record.save(&self.workflows_dir);
 
+        tracing::info!(
+            workflow_id = %record.workflow_id,
+            task_type = ?record.task_type,
+            "Starting sandbox workflow"
+        );
+
         // Phase 1: Initialize sandbox
-        tracing::info!(workflow_id = %record.workflow_id, "Starting sandbox workflow");
         match self.initialize_sandbox(&mut record).await {
             Ok(()) => {}
             Err(e) => {
@@ -91,7 +98,212 @@ impl Orchestrator {
             }
         }
 
-        // Phase 2: Generate initial plan
+        // Branch by task type
+        match record.task_type.clone() {
+            TaskType::Research => self.run_research(record).await,
+            TaskType::Data => self.run_data(record).await,
+            TaskType::Admin => self.run_admin(record).await,
+            TaskType::Eng => self.run_eng(record).await,
+        }
+    }
+
+    /// Research: analyze code, post findings. No approval, no PR.
+    async fn run_research(&self, mut record: WorkflowRecord) -> anyhow::Result<()> {
+        record.transition(WorkflowState::Executing);
+        let _ = record.save(&self.workflows_dir);
+
+        let sid = record.sandbox_id.as_deref().unwrap_or_default();
+        let escaped_task = record.task.replace('\'', "'\\''");
+        let cmd = format!(
+            "claude -p 'Analyze this codebase and answer the following. Report your findings thoroughly.\n\nTask: {escaped_task}' --dangerously-skip-permissions --output-format json"
+        );
+
+        let result = self
+            .e2b
+            .exec(
+                sid,
+                &cmd,
+                self.config.exec_timeout_secs,
+                Some("/home/user/project"),
+            )
+            .await;
+
+        match result {
+            Ok(r) if r.exit_code == 0 => {
+                let (text, _) = parse_claude_output(&r.stdout).unwrap_or((r.stdout, None));
+                self.post_summary_and_reply(&mut record, &text).await;
+            }
+            Ok(r) => {
+                let detail = if r.stderr.is_empty() {
+                    &r.stdout
+                } else {
+                    &r.stderr
+                };
+                self.fail(&mut record, &format!("Research failed: {detail}"))
+                    .await;
+                return Ok(());
+            }
+            Err(e) => {
+                self.fail(&mut record, &format!("Research failed: {e}"))
+                    .await;
+                return Ok(());
+            }
+        }
+
+        record.transition(WorkflowState::Completed);
+        let _ = record.save(&self.workflows_dir);
+        self.cleanup(&record).await;
+        tracing::info!(workflow_id = %record.workflow_id, "Research workflow completed");
+        Ok(())
+    }
+
+    /// Data: query MCP tools, post results. No approval, no PR.
+    async fn run_data(&self, mut record: WorkflowRecord) -> anyhow::Result<()> {
+        record.transition(WorkflowState::Executing);
+        let _ = record.save(&self.workflows_dir);
+
+        let sid = record.sandbox_id.as_deref().unwrap_or_default();
+        let escaped_task = record.task.replace('\'', "'\\''");
+        let cwd = if record.repo_url.is_empty() {
+            "/home/user"
+        } else {
+            "/home/user/project"
+        };
+        let cmd = format!(
+            "claude -p '{escaped_task}. Use the available MCP tools to query data and report the results.' --dangerously-skip-permissions --output-format json"
+        );
+
+        let result = self
+            .e2b
+            .exec(sid, &cmd, self.config.exec_timeout_secs, Some(cwd))
+            .await;
+
+        match result {
+            Ok(r) if r.exit_code == 0 => {
+                let (text, _) = parse_claude_output(&r.stdout).unwrap_or((r.stdout, None));
+                self.post_summary_and_reply(&mut record, &text).await;
+            }
+            Ok(r) => {
+                let detail = if r.stderr.is_empty() {
+                    &r.stdout
+                } else {
+                    &r.stderr
+                };
+                self.fail(&mut record, &format!("Data query failed: {detail}"))
+                    .await;
+                return Ok(());
+            }
+            Err(e) => {
+                self.fail(&mut record, &format!("Data query failed: {e}"))
+                    .await;
+                return Ok(());
+            }
+        }
+
+        record.transition(WorkflowState::Completed);
+        let _ = record.save(&self.workflows_dir);
+        self.cleanup(&record).await;
+        tracing::info!(workflow_id = %record.workflow_id, "Data workflow completed");
+        Ok(())
+    }
+
+    /// Admin: plan admin actions, get approval, execute, post results. No PR.
+    async fn run_admin(&self, mut record: WorkflowRecord) -> anyhow::Result<()> {
+        // Plan phase
+        record.transition(WorkflowState::Planning);
+        let _ = record.save(&self.workflows_dir);
+
+        let sid = record.sandbox_id.clone().unwrap_or_default();
+        let escaped_task = record.task.replace('\'', "'\\''");
+        let cwd = if record.repo_url.is_empty() {
+            "/home/user"
+        } else {
+            "/home/user/project"
+        };
+        let plan_cmd = format!(
+            "claude -p 'Plan the following admin actions. Do NOT execute yet — only describe what API calls you would make and what the effects would be.\n\nTask: {escaped_task}' --dangerously-skip-permissions --output-format json"
+        );
+
+        let result = self
+            .e2b
+            .exec(&sid, &plan_cmd, self.config.plan_timeout_secs, Some(cwd))
+            .await;
+
+        match result {
+            Ok(r) if r.exit_code == 0 => {
+                let (plan_text, session_id) = parse_claude_output(&r.stdout)?;
+                record.plan_text = Some(plan_text.clone());
+                record.session_id = session_id;
+                self.post_summary_and_reply(&mut record, &plan_text).await;
+            }
+            Ok(r) => {
+                let detail = if r.stderr.is_empty() {
+                    &r.stdout
+                } else {
+                    &r.stderr
+                };
+                self.fail(&mut record, &format!("Admin plan failed: {detail}"))
+                    .await;
+                return Ok(());
+            }
+            Err(e) => {
+                self.fail(&mut record, &format!("Admin plan failed: {e}"))
+                    .await;
+                return Ok(());
+            }
+        }
+
+        // Approval loop
+        self.await_approval(&mut record).await?;
+
+        // Execute
+        record.transition(WorkflowState::Executing);
+        let _ = record.save(&self.workflows_dir);
+
+        let mut exec_cmd = "claude -p 'Execute the admin actions you planned. Run the API calls now.' --dangerously-skip-permissions --output-format json".to_string();
+        if let Some(ref sess_id) = record.session_id {
+            use std::fmt::Write;
+            let _ = write!(exec_cmd, " --resume {sess_id}");
+        }
+
+        let result = self
+            .e2b
+            .exec(&sid, &exec_cmd, self.config.exec_timeout_secs, Some(cwd))
+            .await;
+
+        match result {
+            Ok(r) if r.exit_code == 0 => {
+                let (text, _) = parse_claude_output(&r.stdout).unwrap_or((r.stdout, None));
+                self.post_slack_thread_message(&record, &format!("*Results:*\n\n{text}"))
+                    .await;
+            }
+            Ok(r) => {
+                let detail = if r.stderr.is_empty() {
+                    &r.stdout
+                } else {
+                    &r.stderr
+                };
+                self.fail(&mut record, &format!("Admin execution failed: {detail}"))
+                    .await;
+                return Ok(());
+            }
+            Err(e) => {
+                self.fail(&mut record, &format!("Admin execution failed: {e}"))
+                    .await;
+                return Ok(());
+            }
+        }
+
+        record.transition(WorkflowState::Completed);
+        let _ = record.save(&self.workflows_dir);
+        self.cleanup(&record).await;
+        tracing::info!(workflow_id = %record.workflow_id, "Admin workflow completed");
+        Ok(())
+    }
+
+    /// Eng: plan → approve → execute → PR (original behavior).
+    async fn run_eng(&self, mut record: WorkflowRecord) -> anyhow::Result<()> {
+        // Plan
         record.transition(WorkflowState::Planning);
         let _ = record.save(&self.workflows_dir);
         match self.generate_plan(&mut record).await {
@@ -103,22 +315,81 @@ impl Orchestrator {
             }
         }
 
-        // Phase 3: Feedback loop — poll Slack thread for replies
+        // Approval loop
+        self.await_approval(&mut record).await?;
+
+        // Execute
+        record.transition(WorkflowState::Executing);
+        let _ = record.save(&self.workflows_dir);
+        match self.execute_plan(&mut record).await {
+            Ok(()) => {}
+            Err(e) => {
+                self.fail(&mut record, &format!("Execution failed: {e}"))
+                    .await;
+                return Ok(());
+            }
+        }
+
+        // Create PR
+        record.transition(WorkflowState::CreatingPr);
+        let _ = record.save(&self.workflows_dir);
+        match self.create_pr(&mut record).await {
+            Ok(()) => {}
+            Err(e) => {
+                self.fail(&mut record, &format!("PR creation failed: {e}"))
+                    .await;
+                return Ok(());
+            }
+        }
+
+        record.transition(WorkflowState::Completed);
+        let _ = record.save(&self.workflows_dir);
+        if let Some(ref pr_url) = record.pr_url {
+            self.post_slack_thread_message(&record, &slack_bridge::format_pr_created(pr_url))
+                .await;
+        }
+        self.cleanup(&record).await;
+        tracing::info!(workflow_id = %record.workflow_id, "Eng workflow completed");
+        Ok(())
+    }
+
+    /// Post the summary message to the channel and the detail as a thread reply.
+    async fn post_summary_and_reply(&self, record: &mut WorkflowRecord, detail_text: &str) {
+        let summary = slack_bridge::format_plan_summary(
+            record.task_type.label(),
+            &record.workflow_id,
+            &record.repo_url,
+            &record.task,
+            record.task_type.needs_approval(),
+        );
+        if let Ok(ts) = self
+            .post_slack_message(&record.slack_channel, &summary)
+            .await
+        {
+            record.slack_thread_ts = Some(ts.clone());
+            let _ = record.save(&self.workflows_dir);
+            let detail = slack_bridge::format_plan_detail(detail_text);
+            self.post_slack_reply(&record.slack_channel, &ts, &detail)
+                .await;
+        }
+    }
+
+    /// Shared approval loop — polls Slack thread for approval/cancel/feedback.
+    /// Returns Ok(()) on approval, or transitions to Failed and returns Ok(()).
+    async fn await_approval(&self, record: &mut WorkflowRecord) -> anyhow::Result<()> {
         record.transition(WorkflowState::AwaitingFeedback);
         let _ = record.save(&self.workflows_dir);
 
         let approval_deadline = tokio::time::Instant::now()
             + tokio::time::Duration::from_secs(self.config.approval_timeout_secs);
-        // Track the last message ts we've seen to only fetch new replies
         let mut last_seen_ts = record.slack_thread_ts.clone().unwrap_or_default();
 
         loop {
             if tokio::time::Instant::now() > approval_deadline {
-                self.fail(&mut record, "Approval timed out").await;
-                return Ok(());
+                self.fail(record, "Approval timed out").await;
+                anyhow::bail!("Approval timed out");
             }
 
-            // Poll for new thread replies every 3 seconds
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
             let thread_ts = match record.slack_thread_ts.clone() {
@@ -135,8 +406,8 @@ impl Orchestrator {
                 last_seen_ts = ts;
 
                 if slack_bridge::is_cancel(&text) {
-                    self.fail(&mut record, "Cancelled by user").await;
-                    return Ok(());
+                    self.fail(record, "Cancelled by user").await;
+                    anyhow::bail!("Cancelled by user");
                 }
 
                 if slack_bridge::is_approval(&text) {
@@ -150,72 +421,34 @@ impl Orchestrator {
                     break;
                 }
 
-                // Feedback — revise the plan
+                // Feedback — revise
                 if record.iteration_count >= self.config.max_iterations {
                     self.fail(
-                        &mut record,
+                        record,
                         &format!("Max iterations ({}) reached", self.config.max_iterations),
                     )
                     .await;
-                    return Ok(());
+                    anyhow::bail!("Max iterations reached");
                 }
 
                 record.transition(WorkflowState::Revising);
                 let _ = record.save(&self.workflows_dir);
-                match self.revise_plan(&mut record, &text).await {
+                match self.revise_plan(record, &text).await {
                     Ok(()) => {
                         record.transition(WorkflowState::AwaitingFeedback);
                         let _ = record.save(&self.workflows_dir);
                     }
                     Err(e) => {
-                        self.fail(&mut record, &format!("Revision failed: {e}"))
-                            .await;
-                        return Ok(());
+                        self.fail(record, &format!("Revision failed: {e}")).await;
+                        anyhow::bail!("Revision failed");
                     }
                 }
             }
 
             if approved {
-                break;
-            }
-        }
-
-        // Phase 4: Execute
-        record.transition(WorkflowState::Executing);
-        let _ = record.save(&self.workflows_dir);
-        match self.execute_plan(&mut record).await {
-            Ok(()) => {}
-            Err(e) => {
-                self.fail(&mut record, &format!("Execution failed: {e}"))
-                    .await;
                 return Ok(());
             }
         }
-
-        // Phase 5: Create PR
-        record.transition(WorkflowState::CreatingPr);
-        let _ = record.save(&self.workflows_dir);
-        match self.create_pr(&mut record).await {
-            Ok(()) => {}
-            Err(e) => {
-                self.fail(&mut record, &format!("PR creation failed: {e}"))
-                    .await;
-                return Ok(());
-            }
-        }
-
-        // Phase 6: Complete
-        record.transition(WorkflowState::Completed);
-        let _ = record.save(&self.workflows_dir);
-        if let Some(ref pr_url) = record.pr_url {
-            self.post_slack_thread_message(&record, &slack_bridge::format_pr_created(pr_url))
-                .await;
-        }
-
-        // Cleanup
-        self.cleanup(&record).await;
-        tracing::info!(workflow_id = %record.workflow_id, "Workflow completed");
-        Ok(())
     }
 
     // ── Sandbox lifecycle ─────────────────────────────────────────
@@ -328,23 +561,30 @@ impl Orchestrator {
                 .await?;
         }
 
-        // Clone repo
-        let branch_flag = record
-            .base_branch
-            .as_deref()
-            .map(|b| format!(" -b {b}"))
-            .unwrap_or_default();
-        let clone_cmd = format!(
-            "git clone{branch_flag} {} /home/user/project",
-            record.repo_url
-        );
-        let result = self.e2b.exec(sid, &clone_cmd, 120, None).await?;
-        if result.exit_code != 0 {
-            anyhow::bail!(
-                "git clone failed (exit {}): {}",
-                result.exit_code,
-                result.stderr
+        // Clone repo (skip for data/admin tasks with no repo)
+        if !record.repo_url.is_empty() {
+            let branch_flag = record
+                .base_branch
+                .as_deref()
+                .map(|b| format!(" -b {b}"))
+                .unwrap_or_default();
+            let clone_cmd = format!(
+                "git clone{branch_flag} {} /home/user/project",
+                record.repo_url
             );
+            let result = self.e2b.exec(sid, &clone_cmd, 120, None).await?;
+            if result.exit_code != 0 {
+                anyhow::bail!(
+                    "git clone failed (exit {}): {}",
+                    result.exit_code,
+                    result.stderr
+                );
+            }
+        } else {
+            // Create project dir even without a repo
+            self.e2b
+                .exec(sid, "mkdir -p /home/user/project", 10, None)
+                .await?;
         }
 
         // Install Claude Code CLI if not present
@@ -452,19 +692,7 @@ impl Orchestrator {
         record.plan_text = Some(plan_text.clone());
         record.session_id = session_id;
 
-        // Post short summary to channel, full plan as thread reply
-        let summary =
-            slack_bridge::format_plan_summary(&record.workflow_id, &record.repo_url, &record.task);
-        let ts = self
-            .post_slack_message(&record.slack_channel, &summary)
-            .await?;
-        record.slack_thread_ts = Some(ts.clone());
-        let _ = record.save(&self.workflows_dir);
-
-        // Post full plan in the thread
-        let detail = slack_bridge::format_plan_detail(&plan_text);
-        self.post_slack_reply(&record.slack_channel, &ts, &detail)
-            .await;
+        self.post_summary_and_reply(record, &plan_text).await;
 
         Ok(())
     }

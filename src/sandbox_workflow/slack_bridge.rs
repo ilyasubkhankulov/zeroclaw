@@ -39,13 +39,25 @@ pub fn is_cancel(text: &str) -> bool {
 }
 
 /// Format the short channel message (low footprint).
-pub fn format_plan_summary(workflow_id: &str, repo_url: &str, task: &str) -> String {
-    // Extract repo name from URL
-    let repo_name = repo_url.rsplit('/').next().unwrap_or(repo_url);
-    format!(
-        "*Sandbox `{workflow_id}`* — {task}\n\
-         Repo: `{repo_name}` | Reply in thread: *lgtm* to approve, *cancel* to abort"
-    )
+pub fn format_plan_summary(
+    type_label: &str,
+    workflow_id: &str,
+    repo_url: &str,
+    task: &str,
+    needs_approval: bool,
+) -> String {
+    let repo_part = if repo_url.is_empty() {
+        String::new()
+    } else {
+        let repo_name = repo_url.rsplit('/').next().unwrap_or(repo_url);
+        format!(" in `{repo_name}`")
+    };
+    let action = if needs_approval {
+        "Reply in thread: *lgtm* to approve, *cancel* to abort"
+    } else {
+        "Results will appear in this thread"
+    };
+    format!("*{type_label} `{workflow_id}`* — {task}{repo_part}\n{action}")
 }
 
 /// Format the full plan (posted as a thread reply).
@@ -179,15 +191,17 @@ mod tests {
 
     #[test]
     fn plan_formatting() {
-        let msg = format_plan_message(
+        let msg = format_plan_summary(
+            "Sandbox",
+            "abc123",
             "https://github.com/test/repo",
             "add tests",
-            "1. Create test file\n2. Write tests",
+            true,
         );
-        assert!(msg.contains("Sandbox Coding Plan"));
-        assert!(msg.contains("test/repo"));
+        assert!(msg.contains("abc123"));
+        assert!(msg.contains("repo"));
         assert!(msg.contains("add tests"));
-        assert!(msg.contains("approve"));
+        assert!(msg.contains("lgtm"));
     }
 
     #[tokio::test]
