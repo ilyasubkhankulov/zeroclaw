@@ -88,6 +88,7 @@ pub mod reaction;
 pub mod read_skill;
 pub mod report_template_tool;
 pub mod report_templates;
+pub mod sandbox_coding_task;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
@@ -184,6 +185,7 @@ pub use pushover::PushoverTool;
 pub use reaction::ReactionTool;
 pub use read_skill::ReadSkillTool;
 pub use report_template_tool::ReportTemplateTool;
+pub use sandbox_coding_task::SandboxCodingTaskTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
@@ -789,6 +791,14 @@ pub fn all_tools_with_runtime(
         security.clone(),
         Arc::clone(&channel_map_handle),
     )));
+
+    // Sandbox coding workflow (E2B + Claude Code plan mode)
+    if root_config.sandbox_workflow.enabled {
+        tool_arcs.push(Arc::new(SandboxCodingTaskTool::new(
+            root_config.sandbox_workflow.clone(),
+            workspace_dir,
+        )));
+    }
 
     // SOP tools (registered when sops_dir is configured)
     if root_config.sop.sops_dir.is_some() {

@@ -1,0 +1,10 @@
+# E2B sandbox template for ZeroClaw sandbox coding workflow.
+#
+# Build:
+#   e2b template build -n zeroclaw-claude-code --dockerfile e2b.Dockerfile
+#
+# The resulting template ID goes into your ZeroClaw config:
+#   [sandbox_workflow]
+#   e2b_template = "<template-id>"
+
+dockerfile = "e2b.Dockerfile"

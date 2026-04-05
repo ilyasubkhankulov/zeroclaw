@@ -92,6 +92,8 @@ Last refreshed: **February 18, 2026**.
 - [zai-glm-setup.md](setup-guides/zai-glm-setup.md)
 - [langgraph-integration.md](contributing/langgraph-integration.md)
 
+- [sandbox-workflow.md](reference/sandbox-workflow/README.md)
+
 ### 3) Operations & Deployment
 
 - [ops/README.md](ops/README.md)

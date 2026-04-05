@@ -5172,7 +5172,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         mut built_tools,
         delegate_handle_ch,
         reaction_handle_ch,
-        _channel_map_handle,
+        channel_map_handle,
         ask_user_handle_ch,
         escalate_handle_ch,
     ) = tools::all_tools_with_runtime(
@@ -5464,6 +5464,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+
+    // Populate the shared channel map (used by poll, sandbox_coding_task, etc.)
+    {
+        let mut map = channel_map_handle.write();
+        for (name, ch) in channels_by_name.as_ref() {
+            map.insert(name.clone(), Arc::clone(ch));
+        }
+    }
 
     // Populate the reaction tool's channel map now that channels are initialized.
     if let Some(ref handle) = reaction_handle_ch {

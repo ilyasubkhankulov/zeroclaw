@@ -919,6 +919,9 @@ pub async fn run_gateway(
         .route("/webhook/gmail", post(handle_gmail_push_webhook))
         // ── Claude Code runner hooks ──
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
+        // ── Sandbox Workflow API ──
+        .route("/api/sandbox-workflows", get(api::handle_sandbox_workflow_list))
+        .route("/api/sandbox-workflow/{id}", get(api::handle_sandbox_workflow_status))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
         .route("/api/config", get(api::handle_api_config_get))

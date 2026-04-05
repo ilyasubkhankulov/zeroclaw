@@ -1534,6 +1534,77 @@ pub async fn handle_claude_code_hook(
     Json(serde_json::json!({ "ok": true }))
 }
 
+// ── Sandbox Workflow API ──────────────────────────────────────
+
+/// GET /api/sandbox-workflow/{id} — get the status of a sandbox coding workflow.
+pub async fn handle_sandbox_workflow_status(
+    State(state): State<AppState>,
+    axum::extract::Path(workflow_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let config = state.config.lock();
+    let workflows_dir = std::path::Path::new(&config.workspace_dir).join("sandbox_workflows");
+    let path = workflows_dir.join(format!("{workflow_id}.json"));
+
+    if !path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Workflow not found" })),
+        );
+    }
+
+    match crate::sandbox_workflow::state::WorkflowRecord::load(&path) {
+        Ok(record) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "workflow_id": record.workflow_id,
+                "state": record.state.label(),
+                "repo_url": record.repo_url,
+                "task": record.task,
+                "pr_url": record.pr_url,
+                "iteration_count": record.iteration_count,
+                "created_at": record.created_at,
+                "updated_at": record.updated_at,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Failed to load workflow: {e}") })),
+        ),
+    }
+}
+
+/// GET /api/sandbox-workflows — list all sandbox coding workflows.
+pub async fn handle_sandbox_workflow_list(State(state): State<AppState>) -> impl IntoResponse {
+    let config = state.config.lock();
+    let workflows_dir = std::path::Path::new(&config.workspace_dir).join("sandbox_workflows");
+
+    if !workflows_dir.exists() {
+        return Json(serde_json::json!({ "workflows": [] }));
+    }
+
+    let mut workflows = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&workflows_dir) {
+        for entry in entries.flatten() {
+            if entry.path().extension().is_some_and(|ext| ext == "json") {
+                if let Ok(record) =
+                    crate::sandbox_workflow::state::WorkflowRecord::load(&entry.path())
+                {
+                    workflows.push(serde_json::json!({
+                        "workflow_id": record.workflow_id,
+                        "state": record.state.label(),
+                        "repo_url": record.repo_url,
+                        "task": record.task,
+                        "pr_url": record.pr_url,
+                        "created_at": record.created_at,
+                    }));
+                }
+            }
+        }
+    }
+
+    Json(serde_json::json!({ "workflows": workflows }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
