@@ -15,6 +15,10 @@ use super::github_app::GitHubAppAuth;
 use super::slack_bridge;
 use super::state::{TaskType, WorkflowRecord, WorkflowState};
 
+/// Preamble prepended to all Claude Code prompts in sandboxes.
+/// Tells Claude its output is automatically posted to Slack.
+const SANDBOX_PREAMBLE: &str = "You are running inside an automated sandbox. Your text output will be automatically posted to a Slack channel — you do not need to post to Slack yourself. Just write your response directly. Do not mention Slack, do not say you cannot post, do not ask the user to share manually.\n\n";
+
 /// Parameters for launching a new workflow.
 pub struct WorkflowParams {
     pub task: String,
@@ -139,7 +143,7 @@ impl Orchestrator {
         let sid = record.sandbox_id.as_deref().unwrap_or_default();
         let escaped_task = record.task.replace('\'', "'\\''");
         let cmd = format!(
-            "claude -p 'Analyze this codebase and answer the following. Report your findings thoroughly.\n\nTask: {escaped_task}' --dangerously-skip-permissions --output-format json"
+            "claude -p '{SANDBOX_PREAMBLE}Analyze this codebase and answer the following. Report your findings thoroughly.\n\nTask: {escaped_task}' --dangerously-skip-permissions --output-format json"
         );
 
         let result = self
@@ -194,7 +198,7 @@ impl Orchestrator {
             "/home/user/project"
         };
         let cmd = format!(
-            "claude -p '{escaped_task}. Use the available MCP tools to query data and report the results.' --dangerously-skip-permissions --output-format json"
+            "claude -p '{SANDBOX_PREAMBLE}{escaped_task}. Use the available MCP tools to query data and report the results.' --dangerously-skip-permissions --output-format json"
         );
 
         let result = self
@@ -245,7 +249,7 @@ impl Orchestrator {
             "/home/user/project"
         };
         let plan_cmd = format!(
-            "claude -p 'Plan the following admin actions. Do NOT execute yet — only describe what API calls you would make and what the effects would be.\n\nTask: {escaped_task}' --dangerously-skip-permissions --output-format json"
+            "claude -p '{SANDBOX_PREAMBLE}Plan the following admin actions. Do NOT execute yet — only describe what API calls you would make and what the effects would be.\n\nTask: {escaped_task}' --dangerously-skip-permissions --output-format json"
         );
 
         let result = self
@@ -284,7 +288,7 @@ impl Orchestrator {
         record.transition(WorkflowState::Executing);
         let _ = record.save(&self.workflows_dir);
 
-        let mut exec_cmd = "claude -p 'Execute the admin actions you planned. Run the API calls now.' --dangerously-skip-permissions --output-format json".to_string();
+        let mut exec_cmd = format!("claude -p '{SANDBOX_PREAMBLE}Execute the admin actions you planned. Run the API calls now.' --dangerously-skip-permissions --output-format json");
         if let Some(ref sess_id) = record.session_id {
             use std::fmt::Write;
             let _ = write!(exec_cmd, " --resume {sess_id}");
@@ -298,7 +302,7 @@ impl Orchestrator {
         match result {
             Ok(r) if r.exit_code == 0 => {
                 let (text, _) = parse_claude_output(&r.stdout).unwrap_or((r.stdout, None));
-                self.post_slack_thread_message(&record, &format!("*Results:*\n\n{text}"))
+                self.post_slack_thread_message(&record, &slack_bridge::format_results(&text))
                     .await;
             }
             Ok(r) => {
@@ -369,8 +373,8 @@ impl Orchestrator {
         record.transition(WorkflowState::Completed);
         let _ = record.save(&self.workflows_dir);
         if let Some(ref pr_url) = record.pr_url {
-            self.post_slack_thread_message(&record, &slack_bridge::format_pr_created(pr_url))
-                .await;
+            let pr_msg = slack_bridge::format_pr_created(pr_url);
+            self.post_slack_thread_message(&record, &pr_msg).await;
         }
         self.cleanup(&record).await;
         tracing::info!(workflow_id = %record.workflow_id, "Eng workflow completed");
@@ -386,15 +390,11 @@ impl Orchestrator {
             &record.task,
             record.task_type.needs_approval(),
         );
-        if let Ok(ts) = self
-            .post_slack_message(&record.slack_channel, &summary)
-            .await
-        {
+        if let Ok(ts) = self.post_slack_message(&record.slack_channel, &summary).await {
             record.slack_thread_ts = Some(ts.clone());
             let _ = record.save(&self.workflows_dir);
             let detail = slack_bridge::format_plan_detail(detail_text);
-            self.post_slack_reply(&record.slack_channel, &ts, &detail)
-                .await;
+            self.post_slack_reply(&record.slack_channel, &ts, &detail).await;
         }
     }
 
@@ -435,12 +435,9 @@ impl Orchestrator {
                 }
 
                 if slack_bridge::is_approval(&text) {
-                    self.post_slack_reply(
-                        &record.slack_channel,
-                        &thread_ts,
-                        &slack_bridge::format_execution_started(),
-                    )
-                    .await;
+                    let exec_msg = slack_bridge::format_execution_started();
+                    self.post_slack_reply(&record.slack_channel, &thread_ts, &exec_msg)
+                        .await;
                     approved = true;
                     break;
                 }
@@ -687,7 +684,7 @@ impl Orchestrator {
         // Claude Code to only analyze and plan, not make changes.
         let escaped_task = record.task.replace('\'', "'\\''");
         let cmd = format!(
-            "claude -p 'Analyze this codebase and create a detailed plan for the following task. Do NOT make any changes yet — only read files and describe what you would do, which files you would modify, and what the changes would be.\n\nTask: {}' --dangerously-skip-permissions --output-format json",
+            "claude -p '{SANDBOX_PREAMBLE}Analyze this codebase and create a detailed plan for the following task. Do NOT make any changes yet — only read files and describe what you would do, which files you would modify, and what the changes would be.\n\nTask: {}' --dangerously-skip-permissions --output-format json",
             escaped_task
         );
 
@@ -731,7 +728,7 @@ impl Orchestrator {
 
         let escaped_feedback = feedback.replace('\'', "'\\''");
         let mut cmd = format!(
-            "claude -p 'Revise the plan based on this feedback. Do NOT make any changes yet — only update your plan.\n\nFeedback: {escaped_feedback}' --dangerously-skip-permissions --output-format json"
+            "claude -p '{SANDBOX_PREAMBLE}Revise the plan based on this feedback. Do NOT make any changes yet — only update your plan.\n\nFeedback: {escaped_feedback}' --dangerously-skip-permissions --output-format json"
         );
 
         if let Some(ref sess_id) = record.session_id {
@@ -769,8 +766,8 @@ impl Orchestrator {
         }
         record.iteration_count += 1;
 
-        let message_text = slack_bridge::format_revised_plan(&plan_text, record.iteration_count);
-        self.post_slack_thread_message(record, &message_text).await;
+        let revised_msg = slack_bridge::format_revised_plan(&plan_text, record.iteration_count);
+        self.post_slack_thread_message(record, &revised_msg).await;
 
         Ok(())
     }
@@ -781,7 +778,7 @@ impl Orchestrator {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("No sandbox"))?;
 
-        let mut cmd = "claude -p 'Execute the approved plan. Make all the code changes and commit them.' --dangerously-skip-permissions --output-format json".to_string();
+        let mut cmd = format!("claude -p '{SANDBOX_PREAMBLE}Execute the approved plan. Make all the code changes and commit them.' --dangerously-skip-permissions --output-format json");
 
         if let Some(ref sess_id) = record.session_id {
             use std::fmt::Write;
@@ -896,14 +893,19 @@ impl Orchestrator {
     // ── Slack Web API (direct calls for threading) ────────────────
 
     /// Post a message to a Slack channel and return the message ts.
-    async fn post_slack_message(&self, channel: &str, text: &str) -> anyhow::Result<String> {
+    async fn post_slack_message(
+        &self,
+        channel: &str,
+        msg: &slack_bridge::SlackMessage,
+    ) -> anyhow::Result<String> {
         let resp = self
             .http
             .post("https://slack.com/api/chat.postMessage")
             .bearer_auth(&self.slack_bot_token)
             .json(&serde_json::json!({
                 "channel": channel,
-                "text": text,
+                "blocks": msg.blocks,
+                "text": msg.text,
             }))
             .send()
             .await?;
@@ -921,14 +923,20 @@ impl Orchestrator {
     }
 
     /// Post a reply in a Slack thread.
-    async fn post_slack_reply(&self, channel: &str, thread_ts: &str, text: &str) {
+    async fn post_slack_reply(
+        &self,
+        channel: &str,
+        thread_ts: &str,
+        msg: &slack_bridge::SlackMessage,
+    ) {
         let result = self
             .http
             .post("https://slack.com/api/chat.postMessage")
             .bearer_auth(&self.slack_bot_token)
             .json(&serde_json::json!({
                 "channel": channel,
-                "text": text,
+                "blocks": msg.blocks,
+                "text": msg.text,
                 "thread_ts": thread_ts,
             }))
             .send()
@@ -940,12 +948,16 @@ impl Orchestrator {
     }
 
     /// Post a message in the workflow's Slack thread (or channel if no thread).
-    async fn post_slack_thread_message(&self, record: &WorkflowRecord, text: &str) {
+    async fn post_slack_thread_message(
+        &self,
+        record: &WorkflowRecord,
+        msg: &slack_bridge::SlackMessage,
+    ) {
         if let Some(ref thread_ts) = record.slack_thread_ts {
-            self.post_slack_reply(&record.slack_channel, thread_ts, text)
+            self.post_slack_reply(&record.slack_channel, thread_ts, msg)
                 .await;
         } else {
-            let _ = self.post_slack_message(&record.slack_channel, text).await;
+            let _ = self.post_slack_message(&record.slack_channel, msg).await;
         }
     }
 
@@ -1030,8 +1042,8 @@ impl Orchestrator {
         });
         let _ = record.save(&self.workflows_dir);
 
-        self.post_slack_thread_message(record, &slack_bridge::format_failure(reason))
-            .await;
+        let fail_msg = slack_bridge::format_failure(reason);
+        self.post_slack_thread_message(record, &fail_msg).await;
         self.cleanup(record).await;
     }
 

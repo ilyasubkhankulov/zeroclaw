@@ -107,20 +107,19 @@ import json, sys, os
 os.environ["E2B_API_KEY"] = {api_key}
 from e2b import Sandbox
 sbx = Sandbox.connect({sandbox_id})
-try:
-    r = sbx.commands.run({cmd}, cwd={cwd}, timeout={timeout})
-    print(json.dumps({{"stdout": r.stdout, "stderr": r.stderr, "exit_code": r.exit_code}}))
-except Exception as e:
-    err = str(e)
-    stdout = getattr(e, 'stdout', '') or ''
-    stderr = getattr(e, 'stderr', '') or err
-    code = getattr(e, 'exit_code', 1) or 1
-    if code == 1 and "exited with code" in err:
-        try:
-            code = int(err.split("exited with code")[1].split()[0])
-        except Exception:
-            pass
-    print(json.dumps({{"stdout": stdout, "stderr": stderr, "exit_code": code}}))
+wrapped_cmd = 'bash -c ' + repr({cmd} + ' 2>&1; echo __EXIT_CODE__:$?')
+r = sbx.commands.run(wrapped_cmd, cwd={cwd}, timeout={timeout})
+stdout = r.stdout
+code = 0
+# Parse exit code from our marker
+if '__EXIT_CODE__:' in stdout:
+    lines = stdout.rsplit('__EXIT_CODE__:', 1)
+    stdout = lines[0].rstrip()
+    try:
+        code = int(lines[1].strip())
+    except Exception:
+        pass
+print(json.dumps({{"stdout": stdout, "stderr": r.stderr, "exit_code": code}}))
 "#,
             api_key = py_str(&self.api_key),
             sandbox_id = py_str(sandbox_id),
