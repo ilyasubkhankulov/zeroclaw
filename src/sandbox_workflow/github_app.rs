@@ -19,10 +19,20 @@ pub struct GitHubAppAuth {
 
 impl GitHubAppAuth {
     /// Create from App ID, PEM-encoded private key, and installation ID.
+    /// Accepts both PKCS#1 (`BEGIN RSA PRIVATE KEY`) and PKCS#8 (`BEGIN PRIVATE KEY`).
     pub fn new(app_id: &str, private_key_pem: &str, installation_id: u64) -> anyhow::Result<Self> {
         let der = pem_to_der(private_key_pem)?;
-        let key_pair = RsaKeyPair::from_pkcs8(&der)
-            .map_err(|e| anyhow::anyhow!("Invalid RSA private key: {e}"))?;
+
+        // Try PKCS#8 first, then convert from PKCS#1 if needed.
+        // GitHub App private keys are PKCS#1; ring requires PKCS#8.
+        let key_pair = if private_key_pem.contains("BEGIN RSA PRIVATE KEY") {
+            let pkcs8_der = pkcs1_to_pkcs8(&der)?;
+            RsaKeyPair::from_pkcs8(&pkcs8_der)
+                .map_err(|e| anyhow::anyhow!("Invalid RSA private key (PKCS#1→PKCS#8): {e}"))?
+        } else {
+            RsaKeyPair::from_pkcs8(&der)
+                .map_err(|e| anyhow::anyhow!("Invalid RSA private key (PKCS#8): {e}"))?
+        };
 
         Ok(Self {
             app_id: app_id.to_string(),
@@ -121,6 +131,57 @@ impl GitHubAppAuth {
 /// Base64url-encode without padding (JWT standard).
 fn base64_url_encode(data: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+}
+
+/// Wrap a PKCS#1 RSA private key DER in a PKCS#8 envelope.
+///
+/// PKCS#8 = SEQUENCE { AlgorithmIdentifier, OCTET STRING(PKCS#1 key) }
+/// The AlgorithmIdentifier for RSA is: OID 1.2.840.113549.1.1.1, NULL
+fn pkcs1_to_pkcs8(pkcs1_der: &[u8]) -> anyhow::Result<Vec<u8>> {
+    // RSA AlgorithmIdentifier: SEQUENCE { OID 1.2.840.113549.1.1.1, NULL }
+    let algo_id: &[u8] = &[
+        0x30, 0x0d, // SEQUENCE, 13 bytes
+        0x06, 0x09, // OID, 9 bytes
+        0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, // 1.2.840.113549.1.1.1
+        0x05, 0x00, // NULL
+    ];
+
+    // Wrap PKCS#1 in OCTET STRING
+    let octet_string = der_wrap(0x04, pkcs1_der);
+
+    // Version INTEGER 0
+    let version: &[u8] = &[0x02, 0x01, 0x00];
+
+    // Outer SEQUENCE
+    let mut inner = Vec::new();
+    inner.extend_from_slice(version);
+    inner.extend_from_slice(algo_id);
+    inner.extend_from_slice(&octet_string);
+
+    Ok(der_wrap(0x30, &inner))
+}
+
+/// DER TLV wrapper: tag + length + value.
+fn der_wrap(tag: u8, value: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    let len = value.len();
+    if len < 0x80 {
+        out.push(len as u8);
+    } else if len < 0x100 {
+        out.push(0x81);
+        out.push(len as u8);
+    } else if len < 0x10000 {
+        out.push(0x82);
+        out.push((len >> 8) as u8);
+        out.push(len as u8);
+    } else {
+        out.push(0x83);
+        out.push((len >> 16) as u8);
+        out.push((len >> 8) as u8);
+        out.push(len as u8);
+    }
+    out.extend_from_slice(value);
+    out
 }
 
 /// Extract DER bytes from a PEM-encoded RSA private key.
