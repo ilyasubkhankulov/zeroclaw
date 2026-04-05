@@ -3,6 +3,8 @@ name: Docker Dev Image
 on:
   push:
     branches: [master, feat/**]
+  pull_request:
+    branches: [feat/**]
 
 concurrency:
   group: docker-dev-${{ github.ref }}
